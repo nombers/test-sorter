@@ -5,10 +5,8 @@ import yaml
 
 @dataclass
 class SystemLayoutConfig:
-    unloading_tripods: int
-    loading_tripods: int
-    racks_in_loading_zone: int
-    racks_in_unloading_zone: int
+    unloading_rack: int
+    loading_rack: int
 
 
 def load_system_layout_config(path: Path | None = None) -> SystemLayoutConfig:
@@ -20,8 +18,6 @@ def load_system_layout_config(path: Path | None = None) -> SystemLayoutConfig:
         raw = yaml.safe_load(f)
 
     return SystemLayoutConfig(
-        unloading_tripods=raw["tripods"]["unloading"],
-        loading_tripods=raw["tripods"]["loading"],
-        racks_in_loading_zone=raw["racks"]["loading_zone"],
-        racks_in_unloading_zone=raw["racks"]["unloading_zone"],
+        unloading_rack=raw["rack"]["unloading"],
+        loading_rack=raw["rack"]["loading"],
     )

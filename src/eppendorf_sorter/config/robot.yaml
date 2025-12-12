@@ -1,0 +1,14 @@
+robot:
+  ip: "192.168.124.2"
+  robot_program_name: "movement_robot"
+  name: "movement_robot"
+
+scanner:
+  ip: "192.168.124.4"
+  port: 6000
+  name: "hikrobot_scanner"
+  timeout: 2.5
+  
+lis:
+  ip: "127.0.0.1"
+  port: 7114

@@ -1,7 +1,7 @@
 # domain/racks.py
 """
-Модуль управления штативами для системы сортировки пробирок.
-Интегрируется с main.py и обеспечивает thread-safe управление штативами.
+Модуль управления штативами и паллетами для системы сортировки пробирок.
+Интегрируется с main.py и обеспечивает thread-safe управление.
 """
 
 from enum import Enum
@@ -11,6 +11,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# ===================== ENUMS =====================
 
 class TestType(Enum):
     """Типы тестов"""
@@ -23,7 +25,7 @@ class TestType(Enum):
 
 
 class RackStatus(Enum):
-    """Статусы заполненности штативов"""
+    """Статусы заполненности"""
     EMPTY = "empty"           # Пустой
     PARTIAL = "partial"       # Частично заполнен
     TARGET_REACHED = "target_reached"  # Достигнуто целевое значение
@@ -31,92 +33,147 @@ class RackStatus(Enum):
 
 
 class RackOccupancy(Enum):
-    """Статусы занятости штативов"""
+    """Статусы занятости"""
     FREE = "free"             # Свободен
     BUSY_ROBOT = "busy_robot" # Занят роботом
     WAITING_REPLACE = "waiting_replace"  # Ожидает замены
 
 
+# ===================== TUBEINFO =====================
+
 class TubeInfo:
-    """Информация о пробирке"""
+    """
+    Информация о пробирке.
+    """
     
-    def __init__(self, barcode: str, source_pallet: int, row: int, col: int, 
-                 test_type: TestType):
+    def __init__(self, barcode: str, source_rack: int, number: int, 
+                 test_type: TestType, destination_rack: Optional[int] = None,
+                 destination_number: Optional[int] = None):
         self.barcode = barcode
-        self.source_pallet = source_pallet
-        self.row = row
-        self.col = col
+        self.source_rack = source_rack
+        self.number = number  # Номер пробирки в исходном штативе (0-49)
         self.test_type = test_type
-        self.destination_rack: Optional[int] = None
-        self.destination_row: Optional[int] = None
-        self.destination_col: Optional[int] = None
+        
+        # Назначение от ЛИС (куда ДОЛЖНА попасть пробирка)
+        self.destination_rack_lis: Optional[int] = destination_rack  # ID штатива от ЛИС
+        self.destination_number_lis: Optional[int] = destination_number  # Позиция от ЛИС (0-49)
+        
+        # Фактическое размещение (куда РЕАЛЬНО поместили)
+        self.destination_rack: Optional[int] = None  # Реальный ID штатива
+        self.destination_number: Optional[int] = None  # Реальная позиция (0-49)
+    
+    # ========== СВОЙСТВА ДЛЯ ИСТОЧНИКА ==========
+    
+    @property
+    def row(self) -> int:
+        """Получить ряд из номера (0-9)"""
+        return self.number // 5
+    
+    @property
+    def col(self) -> int:
+        """Получить колонку из номера (0-4)"""
+        return self.number % 5
+    
+    # ========== СВОЙСТВА ДЛЯ НАЗНАЧЕНИЯ ОТ ЛИС ==========
+    
+    @property
+    def destination_row_lis(self) -> Optional[int]:
+        """Получить ряд назначения от ЛИС"""
+        if self.destination_number_lis is None:
+            return None
+        return self.destination_number_lis // 5
+    
+    @property
+    def destination_col_lis(self) -> Optional[int]:
+        """Получить колонку назначения от ЛИС"""
+        if self.destination_number_lis is None:
+            return None
+        return self.destination_number_lis % 5
+    
+    # ========== СВОЙСТВА ДЛЯ ФАКТИЧЕСКОГО РАЗМЕЩЕНИЯ ==========
+    
+    @property
+    def destination_row(self) -> Optional[int]:
+        """Получить ряд фактического назначения"""
+        if self.destination_number is None:
+            return None
+        return self.destination_number // 5
+    
+    @property
+    def destination_col(self) -> Optional[int]:
+        """Получить колонку фактического назначения"""
+        if self.destination_number is None:
+            return None
+        return self.destination_number % 5
+    
+    # ========== ПРОВЕРКИ ==========
+    
+    @property
+    def is_placed(self) -> bool:
+        """Проверка, размещена ли пробирка физически"""
+        return self.destination_rack is not None
+    
+    @property
+    def is_rack_correct(self) -> bool:
+        """Проверка, размещена ли в правильный штатив (позиция может отличаться)"""
+        if not self.is_placed or self.destination_rack_lis is None:
+            return False
+        return self.destination_rack == self.destination_rack_lis
+    
+    @property
+    def is_placed_correctly(self) -> bool:
+        """Проверка, размещена ли в правильный штатив И позицию"""
+        if not self.is_placed or self.destination_rack_lis is None:
+            return False
+        return (self.destination_rack == self.destination_rack_lis and 
+                self.destination_number == self.destination_number_lis)
+    
+    # ========== УТИЛИТЫ ==========
+    
+    @staticmethod
+    def number_from_position(row: int, col: int) -> int:
+        """Получить номер из позиции (row, col)"""
+        return row * 5 + col
+    
+    @staticmethod
+    def position_from_number(number: int) -> Tuple[int, int]:
+        """Получить позицию (row, col) из номера"""
+        return (number // 5, number % 5)
     
     def __repr__(self):
+        placement = ""
+        if self.is_placed:
+            rack_check = "✓" if self.is_rack_correct else "✗"
+            pos_check = "✓" if self.is_placed_correctly else "✗"
+            placement = (f", dest_fact=R{self.destination_rack}[#{self.destination_number}]"
+                        f"(штатив{rack_check},поз{pos_check})")
+        
+        lis_info = ""
+        if self.destination_rack_lis is not None:
+            lis_info = f", dest_lis=R{self.destination_rack_lis}[#{self.destination_number_lis}]"
+        
         return (f"TubeInfo(barcode={self.barcode}, "
-                f"source=P{self.source_pallet}[{self.row},{self.col}], "
-                f"type={self.test_type.value})")
+                f"source=P{self.source_rack}[#{self.number}:r{self.row}c{self.col}], "
+                f"type={self.test_type.value}"
+                f"{lis_info}{placement})")
 
 
-class DestinationRack:
-    """Целевой штатив для размещения пробирок определённого типа"""
+
+# ===================== BASE RACK CLASS =====================
+
+class BaseRack:
+    """
+    Базовый класс для штативов и паллетов.
+    Содержит общую логику управления пробирками и занятости.
+    """
     
     MAX_TUBES = 50  # Максимальная вместимость
     
-    def __init__(self, rack_id: int, position: Tuple[float, float, float], 
-                 test_type: TestType, pallet: int, target: int = 50):
+    def __init__(self, rack_id: int):
         self.rack_id = rack_id
-        self.position = position  # (x, y, z) координаты
-        self.test_type = test_type
-        self.pallet = pallet  # ID паллета для робота
-        self.target = target  # Целевое количество пробирок
-        self.current = 0  # Текущее количество
         self.tubes: List[TubeInfo] = []
-        self.current_row = 0
-        self.current_col = 0
-        
-        # Статусы
         self._occupancy = RackOccupancy.FREE
         self._lock = threading.Lock()
-    
-    # ---------------------- ЗАПОЛНЕННОСТЬ ----------------------
-    
-    def get_status(self) -> RackStatus:
-        """Получить статус заполненности"""
-        with self._lock:
-            if self.current == 0:
-                return RackStatus.EMPTY
-            elif self.current >= self.MAX_TUBES:
-                return RackStatus.FULL
-            elif self.current >= self.target:
-                return RackStatus.TARGET_REACHED
-            else:
-                return RackStatus.PARTIAL
-    
-    def is_empty(self) -> bool:
-        """Проверка пустоты"""
-        with self._lock:
-            return self.current == 0
-    
-    def is_full(self) -> bool:
-        """Физически заполнен (50 пробирок)"""
-        with self._lock:
-            return self.current >= self.MAX_TUBES
-    
-    def reached_target(self) -> bool:
-        """Достигнуто целевое значение"""
-        with self._lock:
-            return self.current >= self.target
-    
-    def can_add_tubes(self) -> bool:
-        """Можно ли добавлять пробирки"""
-        with self._lock:
-            return (self.current < self.MAX_TUBES and 
-                    self._occupancy == RackOccupancy.FREE)
-    
-    def get_available_slots(self) -> int:
-        """Количество свободных мест"""
-        with self._lock:
-            return self.MAX_TUBES - self.current
     
     # ---------------------- ЗАНЯТОСТЬ ----------------------
     
@@ -133,11 +190,11 @@ class DestinationRack:
             self._occupancy = occupancy
     
     def occupy(self):
-        """Занять штатив роботом"""
+        """Занять роботом"""
         self.set_occupancy(RackOccupancy.BUSY_ROBOT)
     
     def release(self):
-        """Освободить штатив"""
+        """Освободить"""
         self.set_occupancy(RackOccupancy.FREE)
     
     def mark_waiting_replace(self):
@@ -145,44 +202,21 @@ class DestinationRack:
         self.set_occupancy(RackOccupancy.WAITING_REPLACE)
     
     def is_available(self) -> bool:
-        """Доступен ли штатив для операций"""
+        """Доступен ли для операций"""
         with self._lock:
             return self._occupancy == RackOccupancy.FREE
     
     def is_busy(self) -> bool:
-        """Занят ли штатив"""
+        """Занят ли"""
         with self._lock:
             return self._occupancy != RackOccupancy.FREE
     
-    # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
-    
-    def add_tube(self, tube: TubeInfo) -> TubeInfo:
-        """Добавить пробирку в штатив"""
-        with self._lock:
-            if self.current >= self.MAX_TUBES:
-                raise ValueError(f"Штатив #{self.rack_id} ({self.test_type.value}) полностью заполнен!")
-            
-            # Устанавливаем координаты назначения
-            tube.destination_rack = self.rack_id
-            tube.destination_row = self.current_row
-            tube.destination_col = self.current_col
-            
-            # Добавляем пробирку
-            self.tubes.append(tube)
-            self.current += 1
-            
-            # Обновляем текущую позицию
-            self.current_col += 1
-            if self.current_col >= 5:  # 5 колонок
-                self.current_col = 0
-                self.current_row += 1
-            
-            return tube
+    # ---------------------- РАБОТА С ПРОБИРКАМИ ----------------------
     
     def get_tube_count(self) -> int:
         """Получить количество пробирок"""
         with self._lock:
-            return self.current
+            return len(self.tubes)
     
     def get_barcodes(self) -> List[str]:
         """Получить список баркодов"""
@@ -194,17 +228,258 @@ class DestinationRack:
         with self._lock:
             return self.tubes.copy()
     
-    # ---------------------- УПРАВЛЕНИЕ ШТАТИВОМ ----------------------
+    def get_tube_by_barcode(self, barcode: str) -> Optional[TubeInfo]:
+        """Найти пробирку по баркоду"""
+        with self._lock:
+            for tube in self.tubes:
+                if tube.barcode == barcode:
+                    return tube
+            return None
+    
+    def has_barcode(self, barcode: str) -> bool:
+        """Проверить наличие пробирки"""
+        return self.get_tube_by_barcode(barcode) is not None
+    
+    # ---------------------- СТАТУСЫ ----------------------
+    
+    def is_empty(self) -> bool:
+        """Пустой ли"""
+        with self._lock:
+            return len(self.tubes) == 0
+    
+    def is_full(self) -> bool:
+        """Полностью заполнен"""
+        with self._lock:
+            return len(self.tubes) >= self.MAX_TUBES
+    
+    # ---------------------- СБРОС ----------------------
     
     def reset(self):
-        """Сброс штатива после замены"""
+        """Сброс (после замены)"""
         with self._lock:
-            self.current = 0
             self.tubes = []
-            self.current_row = 0
-            self.current_col = 0
             self._occupancy = RackOccupancy.FREE
-            logger.info(f"Штатив #{self.rack_id} ({self.test_type.value}) сброшен")
+            logger.info(f"Rack #{self.rack_id} сброшен")
+
+
+# ===================== SOURCE Rack =====================
+
+class SourceRack(BaseRack):
+    """
+    Исходный паллет с пробирками для сканирования и сортировки.
+    Расширяет BaseRack функциональностью сканирования и отслеживания сортировки.
+    """
+    
+    def __init__(self, pallet_id: int):
+        """
+        Args:
+            pallet_id: Уникальный ID паллета (0, 1, 2, ...)
+        """
+        super().__init__(pallet_id)
+        self.pallet_id = pallet_id  # Алиас для единообразия
+        self._sorted_count = 0  # Сколько отсортировано
+    
+    # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
+    
+    def add_scanned_tube(self, tube: TubeInfo):
+        """Добавить отсканированную пробирку"""
+        with self._lock:
+            if tube.source_rack != self.pallet_id:
+                raise ValueError(f"Пробирка принадлежит паллету {tube.source_rack}, а не {self.pallet_id}")
+            
+            # Проверяем дубликат
+            if self.has_barcode(tube.barcode):
+                logger.warning(f"Пробирка {tube.barcode} уже в паллете П{self.pallet_id}")
+                return
+            
+            self.tubes.append(tube)
+            logger.debug(f"Пробирка {tube.barcode} добавлена в П{self.pallet_id} ({len(self.tubes)}/{self.get_expected_count()})")
+    
+    def add_scanned_tubes(self, tubes: List[TubeInfo]):
+        """Добавить несколько пробирок"""
+        for tube in tubes:
+            self.add_scanned_tube(tube)
+    
+    def mark_tube_sorted(self, barcode: str) -> bool:
+        """Отметить пробирку как отсортированную"""
+        with self._lock:
+            tube = self.get_tube_by_barcode(barcode)
+            if not tube:
+                logger.warning(f"Пробирка {barcode} не найдена в П{self.pallet_id}")
+                return False
+            
+            if tube.destination_rack is not None:
+                logger.warning(f"Пробирка {barcode} уже отмечена как отсортированная")
+                return False
+            
+            self._sorted_count += 1
+            logger.debug(f"Пробирка {barcode} отсортирована из П{self.pallet_id} ({self._sorted_count}/{len(self.tubes)})")
+            return True
+    
+    # ---------------------- СТАТУСЫ И ПРОВЕРКИ ----------------------
+    
+    def get_status(self) -> RackStatus:
+        """Получить статус заполненности"""
+        with self._lock:
+            expected = self.get_expected_count()
+            scanned = len(self.tubes)
+            
+            if scanned == 0:
+                return RackStatus.EMPTY
+            elif self._sorted_count >= scanned:
+                return RackStatus.EMPTY  # Все отсортированы
+            elif scanned >= expected:
+                return RackStatus.FULL
+            else:
+                return RackStatus.PARTIAL
+    
+    
+    def get_sorted_count(self) -> int:
+        """Количество отсортированных пробирок"""
+        with self._lock:
+            return self._sorted_count
+    
+    def get_remaining_count(self) -> int:
+        """Количество пробирок, ожидающих сортировки"""
+        with self._lock:
+            return len(self.tubes) - self._sorted_count
+    
+    def is_fully_scanned(self) -> bool:
+        """Все ожидаемые пробирки отсканированы"""
+        with self._lock:
+            return len(self.tubes) >= self.get_expected_count()
+    
+    def has_tubes_to_sort(self) -> bool:
+        """Есть ли пробирки для сортировки"""
+        with self._lock:
+            return self._sorted_count < len(self.tubes)
+    
+    def get_unsorted_tubes(self) -> List[TubeInfo]:
+        """Получить неотсортированные пробирки"""
+        with self._lock:
+            return [t for t in self.tubes if t.destination_rack is None]
+    
+    def get_tubes_by_type(self, test_type: TestType) -> List[TubeInfo]:
+        """Получить пробирки определённого типа"""
+        with self._lock:
+            return [t for t in self.tubes if t.test_type == test_type]
+    
+    # ---------------------- ПРОГРЕСС И СТАТИСТИКА ----------------------
+    
+    def get_scan_progress(self) -> float:
+        """Прогресс сканирования (0.0 - 1.0)"""
+        with self._lock:
+            expected = self.get_expected_count()
+            if expected == 0:
+                return 1.0
+            return min(len(self.tubes) / expected, 1.0)
+    
+    def get_sort_progress(self) -> float:
+        """Прогресс сортировки (0.0 - 1.0)"""
+        with self._lock:
+            if len(self.tubes) == 0:
+                return 0.0
+            return self._sorted_count / len(self.tubes)
+    
+    def get_statistics_by_type(self) -> Dict[TestType, int]:
+        """Статистика по типам тестов"""
+        with self._lock:
+            stats = {}
+            for tube in self.tubes:
+                stats[tube.test_type] = stats.get(tube.test_type, 0) + 1
+            return stats
+    
+    # ---------------------- УПРАВЛЕНИЕ ----------------------
+    
+    def reset(self):
+        """Сброс паллета"""
+        with self._lock:
+            self.tubes = []
+            self._sorted_count = 0
+            self._occupancy = RackOccupancy.FREE
+            logger.info(f"Паллет П{self.pallet_id} сброшен")
+    
+    def clear_sorted(self):
+        """Очистить отсортированные пробирки из памяти"""
+        with self._lock:
+            self.tubes = [t for t in self.tubes if t.destination_rack is None]
+            logger.debug(f"Очищены отсортированные пробирки из П{self.pallet_id}")
+    
+
+
+# ===================== DESTINATION RACK =====================
+
+class DestinationRack(BaseRack):
+    """
+    Целевой штатив для размещения пробирок определённого типа.
+    Расширяет BaseRack функциональностью целевых значений и нумерации.
+    """
+    
+    def __init__(self, rack_id: int, test_type: TestType, pallet: int, target: int = 50):
+        """
+        Args:
+            rack_id: Уникальный ID штатива
+            test_type: Тип теста для этого штатива
+            pallet: ID паллета для робота
+            target: Целевое количество пробирок
+        """
+        super().__init__(rack_id)
+        self.test_type = test_type
+        self.pallet = pallet
+        self.target = target
+        self._next_number = 0  # Следующий номер для размещения пробирки
+    
+    # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
+    
+    def add_tube(self, tube: TubeInfo) -> TubeInfo:
+        """Добавить пробирку в штатив"""
+        with self._lock:
+            if len(self.tubes) >= self.MAX_TUBES:
+                raise ValueError(f"Штатив #{self.rack_id} ({self.test_type.value}) полностью заполнен!")
+            
+            # Устанавливаем место назначения
+            tube.destination_rack = self.rack_id
+            tube.destination_number = self._next_number
+            
+            # Добавляем пробирку
+            self.tubes.append(tube)
+            self._next_number += 1
+            
+            logger.debug(f"Пробирка {tube.barcode} добавлена в штатив #{self.rack_id} на место #{tube.destination_number}")
+            return tube
+    
+    # ---------------------- СТАТУСЫ И ПРОВЕРКИ ----------------------
+    
+    def get_status(self) -> RackStatus:
+        """Получить статус заполненности"""
+        with self._lock:
+            count = len(self.tubes)
+            if count == 0:
+                return RackStatus.EMPTY
+            elif count >= self.MAX_TUBES:
+                return RackStatus.FULL
+            elif count >= self.target:
+                return RackStatus.TARGET_REACHED
+            else:
+                return RackStatus.PARTIAL
+    
+    def reached_target(self) -> bool:
+        """Достигнуто целевое значение"""
+        with self._lock:
+            return len(self.tubes) >= self.target
+    
+    def can_add_tubes(self) -> bool:
+        """Можно ли добавлять пробирки"""
+        with self._lock:
+            return (len(self.tubes) < self.MAX_TUBES and 
+                    self._occupancy == RackOccupancy.FREE)
+    
+    def get_available_slots(self) -> int:
+        """Количество свободных мест"""
+        with self._lock:
+            return self.MAX_TUBES - len(self.tubes)
+    
+    # ---------------------- УПРАВЛЕНИЕ ----------------------
     
     def set_target(self, target: int):
         """Установить новое целевое значение"""
@@ -214,82 +489,198 @@ class DestinationRack:
             self.target = target
             logger.info(f"Штатив #{self.rack_id} ({self.test_type.value}): целевое = {target}")
     
-    # ---------------------- ИНФОРМАЦИЯ ----------------------
-    
-    def get_info(self) -> Dict:
-        """Получить полную информацию о штативе"""
+    def reset(self):
+        """Сброс штатива"""
         with self._lock:
-            return {
-                'rack_id': self.rack_id,
-                'test_type': self.test_type.value,
-                'pallet': self.pallet,
-                'position': self.position,
-                'current': self.current,
-                'target': self.target,
-                'max': self.MAX_TUBES,
-                'status': self.get_status().value,
-                'occupancy': self._occupancy.value,
-                'barcodes_count': len(self.tubes)
-            }
+            self.tubes = []
+            self._next_number = 0
+            self._occupancy = RackOccupancy.FREE
+            logger.info(f"Штатив #{self.rack_id} ({self.test_type.value}) сброшен")
     
-    def __str__(self):
-        status = self.get_status()
-        occupancy = self._occupancy
-        return (f"Штатив #{self.rack_id} ({self.test_type.value}) "
-                f"[{self.current}/{self.target}|{self.MAX_TUBES}] "
-                f"Статус: {status.value}, Занятость: {occupancy.value}")
-    
-    def __repr__(self):
-        return self.__str__()
 
 
-class RackManager:
+class RackSystemManager:
     """
-    Менеджер для управления всеми целевыми штативами в системе.
-    Обеспечивает thread-safe доступ и координацию.
+    Единый менеджер для управления всей системой штативов.
+    Обеспечивает thread-safe доступ и координацию работы.
     """
     
     def __init__(self):
-        self.racks: Dict[int, DestinationRack] = {}
+        # Исходные паллеты
+        self.source_rack: Dict[int, SourceRack] = {}
+        
+        # Целевые штативы
+        self.destination_racks: Dict[int, DestinationRack] = {}
+        
+        # Единая блокировка для всей системы
         self._lock = threading.RLock()
-        logger.info("RackManager инициализирован")
+        
+        logger.info("RackSystemManager инициализирован")
     
-    # ---------------------- ИНИЦИАЛИЗАЦИЯ ----------------------
+    # ==================== ИНИЦИАЛИЗАЦИЯ ====================
     
-    def add_rack(self, rack: DestinationRack):
-        """Добавить штатив в систему"""
+    def add_source_rack(self, pallet: SourceRack):
+        """Добавить исходный паллет"""
         with self._lock:
-            if rack.rack_id in self.racks:
-                logger.warning(f"Штатив #{rack.rack_id} уже существует, перезапись")
-            self.racks[rack.rack_id] = rack
-            logger.info(f"Добавлен штатив #{rack.rack_id} ({rack.test_type.value})")
+            if pallet.pallet_id in self.source_rack:
+                logger.warning(f"Паллет П{pallet.pallet_id} уже существует, перезапись")
+            self.source_rack[pallet.pallet_id] = pallet
+            logger.info(f"Добавлен исходный паллет П{pallet.pallet_id}")
     
-    def initialize_racks(self, racks_list: List[DestinationRack]):
-        """Инициализировать список штативов"""
+    def add_destination_rack(self, rack: DestinationRack):
+        """Добавить целевой штатив"""
+        with self._lock:
+            if rack.rack_id in self.destination_racks:
+                logger.warning(f"Штатив #{rack.rack_id} уже существует, перезапись")
+            self.destination_racks[rack.rack_id] = rack
+            logger.info(f"Добавлен целевой штатив #{rack.rack_id} ({rack.test_type.value})")
+    
+    def initialize_source_pallets(self, pallets_list: List[SourceRack]):
+        """Инициализировать исходные паллеты"""
+        with self._lock:
+            for pallet in pallets_list:
+                self.add_source_pallet(pallet)
+            logger.info(f"Инициализировано {len(pallets_list)} исходных паллетов")
+    
+    def initialize_destination_racks(self, racks_list: List[DestinationRack]):
+        """Инициализировать целевые штативы"""
         with self._lock:
             for rack in racks_list:
-                self.add_rack(rack)
-            logger.info(f"Инициализировано {len(racks_list)} штативов")
+                self.add_destination_rack(rack)
+            logger.info(f"Инициализировано {len(racks_list)} целевых штативов")
     
-    # ---------------------- ДОСТУП К ШТАТИВАМ ----------------------
-    
-    def get_rack(self, rack_id: int) -> Optional[DestinationRack]:
-        """Получить штатив по ID"""
+    def initialize_system(self, pallets_list: List[SourceRack], 
+                         racks_list: List[DestinationRack]):
+        """Инициализировать всю систему (паллеты + штативы)"""
         with self._lock:
-            return self.racks.get(rack_id)
+            self.initialize_source_pallets(pallets_list)
+            self.initialize_destination_racks(racks_list)
+            logger.info("Система полностью инициализирована")
+    
+    # ==================== ДОСТУП К ПАЛЛЕТАМ ====================
+    
+    def get_source_pallet(self, pallet_id: int) -> Optional[SourceRack]:
+        """Получить исходный паллет по ID"""
+        with self._lock:
+            return self.source_pallets.get(pallet_id)
+    
+    def get_all_source_pallets(self) -> List[SourceRack]:
+        """Получить все исходные паллеты"""
+        with self._lock:
+            return list(self.source_pallets.values())
+    
+    # ==================== ДОСТУП К ШТАТИВАМ ====================
+    
+    def get_destination_rack(self, rack_id: int) -> Optional[DestinationRack]:
+        """Получить целевой штатив по ID"""
+        with self._lock:
+            return self.destination_racks.get(rack_id)
     
     def get_racks_by_type(self, test_type: TestType) -> List[DestinationRack]:
-        """Получить все штативы определённого типа"""
+        """Получить штативы определённого типа"""
         with self._lock:
-            return [rack for rack in self.racks.values() 
-                    if rack.test_type == test_type]
+            return [r for r in self.destination_racks.values() if r.test_type == test_type]
     
-    def get_all_racks(self) -> List[DestinationRack]:
-        """Получить все штативы"""
+    def get_all_destination_racks(self) -> List[DestinationRack]:
+        """Получить все целевые штативы"""
         with self._lock:
-            return list(self.racks.values())
+            return list(self.destination_racks.values())
     
-    # ---------------------- ПОИСК ДОСТУПНЫХ ШТАТИВОВ ----------------------
+    # ==================== ОПЕРАЦИИ С ПРОБИРКАМИ В ПАЛЛЕТАХ ====================
+    
+    def add_scanned_tube(self, pallet_id: int, tube: TubeInfo) -> bool:
+        """Добавить отсканированную пробирку в паллет"""
+        with self._lock:
+            pallet = self.get_source_pallet(pallet_id)
+            if not pallet:
+                logger.error(f"Паллет П{pallet_id} не найден")
+                return False
+            
+            try:
+                pallet.add_scanned_tube(tube)
+                return True
+            except ValueError as e:
+                logger.error(f"Ошибка добавления: {e}")
+                return False
+    
+    def add_scanned_tubes_batch(self, pallet_id: int, tubes: List[TubeInfo]) -> int:
+        """Добавить пакет пробирок. Возвращает количество успешно добавленных."""
+        count = 0
+        for tube in tubes:
+            if self.add_scanned_tube(pallet_id, tube):
+                count += 1
+        return count
+    
+    def mark_tube_sorted(self, pallet_id: int, barcode: str) -> bool:
+        """Отметить пробирку в паллете как отсортированную"""
+        with self._lock:
+            pallet = self.get_source_pallet(pallet_id)
+            return pallet.mark_tube_sorted(barcode) if pallet else False
+    
+    # ==================== ОПЕРАЦИИ С ПРОБИРКАМИ В ШТАТИВАХ ====================
+    
+    def add_tube_to_rack(self, rack_id: int, tube: TubeInfo) -> bool:
+        """Добавить пробирку в целевой штатив"""
+        with self._lock:
+            rack = self.get_destination_rack(rack_id)
+            if not rack:
+                logger.error(f"Штатив #{rack_id} не найден")
+                return False
+            
+            try:
+                rack.add_tube(tube)
+                logger.debug(f"Пробирка {tube.barcode} добавлена в штатив #{rack_id}")
+                return True
+            except ValueError as e:
+                logger.error(f"Ошибка добавления: {e}")
+                return False
+    
+    # ==================== ПОИСК ПРОБИРОК ====================
+    
+    def find_tube_in_pallets(self, barcode: str) -> Optional[Tuple[int, TubeInfo]]:
+        """
+        Найти пробирку по баркоду во всех паллетах.
+        Возвращает (pallet_id, tube) или None.
+        """
+        with self._lock:
+            for pallet in self.source_pallets.values():
+                tube = pallet.get_tube_by_barcode(barcode)
+                if tube:
+                    return (pallet.pallet_id, tube)
+            return None
+    
+    def find_tube_in_racks(self, barcode: str) -> Optional[Tuple[int, TubeInfo]]:
+        """
+        Найти пробирку по баркоду во всех штативах.
+        Возвращает (rack_id, tube) или None.
+        """
+        with self._lock:
+            for rack in self.destination_racks.values():
+                tube = rack.get_tube_by_barcode(barcode)
+                if tube:
+                    return (rack.rack_id, tube)
+            return None
+    
+    def find_tube_anywhere(self, barcode: str) -> Optional[Tuple[str, int, TubeInfo]]:
+        """
+        Найти пробирку везде (паллеты + штативы).
+        Возвращает (location_type, id, tube) где location_type = 'pallet' или 'rack'.
+        """
+        # Сначала ищем в паллетах
+        result = self.find_tube_in_pallets(barcode)
+        if result:
+            pallet_id, tube = result
+            return ('pallet', pallet_id, tube)
+        
+        # Затем в штативах
+        result = self.find_tube_in_racks(barcode)
+        if result:
+            rack_id, tube = result
+            return ('rack', rack_id, tube)
+        
+        return None
+    
+    # ==================== ПОИСК ДОСТУПНЫХ ШТАТИВОВ ====================
     
     def find_available_rack(self, test_type: TestType) -> Optional[DestinationRack]:
         """
@@ -297,18 +688,18 @@ class RackManager:
         Приоритет: не достигшие целевого, затем не заполненные физически.
         """
         with self._lock:
-            candidates = [r for r in self.racks.values() 
+            candidates = [r for r in self.destination_racks.values() 
                          if r.test_type == test_type and not r.is_full()]
             
             if not candidates:
                 return None
             
-            # Сначала возвращаем первый не достигший целевого
+            # Сначала не достигшие целевого
             for rack in sorted(candidates, key=lambda r: r.rack_id):
                 if not rack.reached_target():
                     return rack
             
-            # Все достигли целевого, возвращаем первый не заполненный физически
+            # Все достигли целевого, возвращаем первый не заполненный
             return candidates[0] if candidates else None
     
     def has_available_rack(self, test_type: TestType) -> bool:
@@ -316,13 +707,43 @@ class RackManager:
         return self.find_available_rack(test_type) is not None
     
     def get_available_racks(self, test_type: TestType) -> List[DestinationRack]:
-        """Получить список всех доступных штативов для типа"""
+        """Список всех доступных штативов для типа"""
         with self._lock:
-            return [r for r in self.racks.values()
+            return [r for r in self.destination_racks.values()
                     if r.test_type == test_type and r.can_add_tubes()]
     
-    # ---------------------- ПРОВЕРКИ ЗАПОЛНЕННОСТИ ----------------------
+    # ==================== ПРОВЕРКИ СТАТУСОВ ====================
     
+    # Паллеты
+    def are_all_pallets_scanned(self) -> bool:
+        """Все паллеты полностью отсканированы"""
+        with self._lock:
+            return all(p.is_fully_scanned() for p in self.source_pallets.values())
+    
+    def are_all_pallets_sorted(self) -> bool:
+        """Все пробирки из паллетов отсортированы"""
+        with self._lock:
+            return all(not p.has_tubes_to_sort() for p in self.source_pallets.values())
+    
+    def has_tubes_to_sort(self) -> bool:
+        """Есть ли пробирки в паллетах для сортировки"""
+        with self._lock:
+            return any(p.has_tubes_to_sort() for p in self.source_pallets.values())
+    
+    def get_next_pallet_to_scan(self) -> Optional[SourceRack]:
+        """Получить следующий паллет для сканирования"""
+        with self._lock:
+            for pallet in sorted(self.source_pallets.values(), key=lambda p: p.pallet_id):
+                if not pallet.is_fully_scanned() and pallet.is_available():
+                    return pallet
+            return None
+    
+    def get_pallets_with_tubes_to_sort(self) -> List[SourceRack]:
+        """Получить паллеты с пробирками для сортировки"""
+        with self._lock:
+            return [p for p in self.source_pallets.values() if p.has_tubes_to_sort()]
+    
+    # Штативы
     def check_pair_reached_target(self, test_type: TestType) -> bool:
         """
         Проверить, достигли ли оба штатива типа целевого значения.
@@ -332,10 +753,8 @@ class RackManager:
             type_racks = self.get_racks_by_type(test_type)
             
             if test_type == TestType.OTHER:
-                # Для разного только один штатив
                 return type_racks[0].reached_target() if type_racks else False
             
-            # Для остальных - оба должны достичь целевого
             if len(type_racks) != 2:
                 logger.warning(f"Ожидалось 2 штатива типа {test_type.value}, найдено {len(type_racks)}")
                 return False
@@ -343,35 +762,17 @@ class RackManager:
             return all(r.reached_target() for r in type_racks)
     
     def get_racks_needing_replacement(self) -> List[DestinationRack]:
-        """Получить список штативов, требующих замены"""
+        """Список штативов, требующих замены"""
         with self._lock:
-            return [r for r in self.racks.values()
+            return [r for r in self.destination_racks.values()
                     if r.is_full() or r.get_occupancy() == RackOccupancy.WAITING_REPLACE]
     
-    # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
-    
-    def add_tube_to_rack(self, rack_id: int, tube: TubeInfo) -> bool:
-        """Добавить пробирку в штатив"""
-        with self._lock:
-            rack = self.get_rack(rack_id)
-            if rack is None:
-                logger.error(f"Штатив #{rack_id} не найден")
-                return False
-            
-            try:
-                rack.add_tube(tube)
-                logger.debug(f"Пробирка {tube.barcode} добавлена в штатив #{rack_id}")
-                return True
-            except ValueError as e:
-                logger.error(f"Ошибка добавления пробирки: {e}")
-                return False
-    
-    # ---------------------- УПРАВЛЕНИЕ ЦЕЛЕВЫМИ ЗНАЧЕНИЯМИ ----------------------
+    # ==================== УПРАВЛЕНИЕ ЦЕЛЕВЫМИ ЗНАЧЕНИЯМИ ====================
     
     def set_rack_target(self, rack_id: int, target: int):
         """Установить целевое значение для штатива"""
         with self._lock:
-            rack = self.get_rack(rack_id)
+            rack = self.get_destination_rack(rack_id)
             if rack:
                 rack.set_target(target)
             else:
@@ -385,18 +786,27 @@ class RackManager:
                 if rack.rack_id in targets:
                     rack.set_target(targets[rack.rack_id])
     
-    # ---------------------- СБРОС И ЗАМЕНА ----------------------
+    # ==================== СБРОС И ЗАМЕНА ====================
     
-    def reset_rack(self, rack_id: int):
-        """Сбросить штатив (после замены)"""
+    def reset_source_pallet(self, pallet_id: int):
+        """Сбросить исходный паллет"""
         with self._lock:
-            rack = self.get_rack(rack_id)
+            pallet = self.get_source_pallet(pallet_id)
+            if pallet:
+                pallet.reset()
+            else:
+                logger.error(f"Паллет П{pallet_id} не найден")
+    
+    def reset_destination_rack(self, rack_id: int):
+        """Сбросить целевой штатив"""
+        with self._lock:
+            rack = self.get_destination_rack(rack_id)
             if rack:
                 rack.reset()
             else:
                 logger.error(f"Штатив #{rack_id} не найден")
     
-    def reset_pair(self, test_type: TestType):
+    def reset_rack_pair(self, test_type: TestType):
         """Сбросить пару штативов типа"""
         with self._lock:
             type_racks = self.get_racks_by_type(test_type)
@@ -404,108 +814,30 @@ class RackManager:
                 rack.reset()
             logger.info(f"Сброшена пара штативов {test_type.value}")
     
-    # ---------------------- СТАТИСТИКА ----------------------
-    
-    def get_total_tubes(self) -> int:
-        """Общее количество пробирок во всех штативах"""
+    def reset_all_source_pallets(self):
+        """Сбросить все исходные паллеты"""
         with self._lock:
-            return sum(r.get_tube_count() for r in self.racks.values())
+            for pallet in self.source_pallets.values():
+                pallet.reset()
+            logger.info("Все исходные паллеты сброшены")
     
-    def get_tubes_by_type(self, test_type: TestType) -> int:
-        """Количество пробирок определённого типа"""
+    def reset_all_destination_racks(self):
+        """Сбросить все целевые штативы"""
         with self._lock:
-            return sum(r.get_tube_count() 
-                      for r in self.racks.values() 
-                      if r.test_type == test_type)
+            for rack in self.destination_racks.values():
+                rack.reset()
+            logger.info("Все целевые штативы сброшены")
     
-    def get_all_barcodes(self) -> Dict[TestType, List[str]]:
-        """Получить все баркоды, сгруппированные по типам"""
+    def reset_entire_system(self):
+        """Сбросить всю систему (паллеты + штативы)"""
         with self._lock:
-            result = {}
-            for rack in self.racks.values():
-                if rack.test_type not in result:
-                    result[rack.test_type] = []
-                result[rack.test_type].extend(rack.get_barcodes())
-            return result
+            self.reset_all_source_pallets()
+            self.reset_all_destination_racks()
+            logger.info("Вся система сброшена")
     
-    # ---------------------- ИНФОРМАЦИЯ И ЛОГИРОВАНИЕ ----------------------
-    
-    def get_system_status(self) -> str:
-        """Получить текстовый статус системы"""
+    def clear_sorted_tubes(self):
+        """Очистить отсортированные пробирки из паллетов"""
         with self._lock:
-            lines = []
-            lines.append("\n" + "="*80)
-            lines.append("СТАТУС СИСТЕМЫ ШТАТИВОВ")
-            lines.append("="*80)
-            
-            # Группируем по типам
-            types_order = [TestType.UGI, TestType.VPCH, TestType.UGI_VPCH, TestType.OTHER]
-            
-            for test_type in types_order:
-                type_racks = self.get_racks_by_type(test_type)
-                if not type_racks:
-                    continue
-                
-                lines.append(f"\n{test_type.value.upper()}:")
-                for rack in sorted(type_racks, key=lambda r: r.rack_id):
-                    lines.append(f"  {rack}")
-            
-            lines.append(f"\nОБЩАЯ СТАТИСТИКА:")
-            lines.append(f"  Всего штативов: {len(self.racks)}")
-            lines.append(f"  Всего пробирок: {self.get_total_tubes()}")
-            
-            for test_type in types_order:
-                count = self.get_tubes_by_type(test_type)
-                if count > 0:
-                    lines.append(f"  {test_type.value}: {count} пробирок")
-            
-            lines.append("="*80)
-            return '\n'.join(lines)
-    
-    def log_status(self):
-        """Вывести статус в лог"""
-        logger.info(self.get_system_status())
-    
-    def get_racks_info_for_web(self) -> Dict:
-        """Получить информацию о штативах для веб-интерфейса"""
-        with self._lock:
-            result = {
-                'racks': {},
-                'statistics': {
-                    'total_tubes': self.get_total_tubes(),
-                    'by_type': {}
-                }
-            }
-            
-            for rack in self.racks.values():
-                result['racks'][rack.rack_id] = rack.get_info()
-            
-            for test_type in [TestType.UGI, TestType.VPCH, TestType.UGI_VPCH, TestType.OTHER]:
-                result['statistics']['by_type'][test_type.value] = self.get_tubes_by_type(test_type)
-            
-            return result
-
-
-# ---------------------- ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР ----------------------
-
-_rack_manager_instance = None
-_manager_lock = threading.Lock()
-
-
-def get_rack_manager() -> RackManager:
-    """Получить глобальный экземпляр RackManager (Singleton)"""
-    global _rack_manager_instance
-    
-    if _rack_manager_instance is None:
-        with _manager_lock:
-            if _rack_manager_instance is None:
-                _rack_manager_instance = RackManager()
-    
-    return _rack_manager_instance
-
-
-def reset_rack_manager():
-    """Сбросить глобальный экземпляр (для тестирования)"""
-    global _rack_manager_instance
-    with _manager_lock:
-        _rack_manager_instance = None
+            for pallet in self.source_pallets.values():
+                pallet.clear_sorted()
+            logger.info("Отсортированные пробирки очищены из паллетов")

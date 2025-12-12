@@ -5,17 +5,17 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class LoaderNRNumbers:
-    """Номера Number Registers для loader_robot."""
+class RobotNRNumbers:
+    """Номера Number Registers для movement_robot."""
     iteration_starter: int = 1  # команда старт/стоп итерации
     grip_status: int = 2         # статус захвата
-    scan_status: int = 3         # статус сканирования
-    scan_delay: int = 4          # задержка сканирования
+    scan_status: int = 3         # статус сканирования QR
+    scan_delay: int = 4          # задержка для ориентации по QR
     move_status: int = 5         # статус движения
 
 
 @dataclass(frozen=True)
-class LoaderNRValues:
+class RobotNRValues:
     """Значения для Number Registers."""
     # iteration_starter values
     start: int = 1
@@ -41,23 +41,24 @@ class LoaderNRValues:
 
 
 @dataclass(frozen=True)
-class LoaderSRNumbers:
-    """Номера String Registers для loader_robot."""
+class RobotSRNumbers:
+    """Номера String Registers для movement_robot."""
     iteration_type: int = 1  # тип итерации
-    loading_data: int = 2    # данные для движения
+    movement_data: int = 2    # данные для движения пробирки
+    scan_data: int = 3        # данные для сканирования
 
 
 @dataclass(frozen=True)
-class LoaderSRValues:
+class RobotSRValues:
     """Значения для String Registers."""
-    loading: str = "LOADING_ITERATION"
-    stacking: str = "STACKING_ITERATION"
-    breaking: str = "BREAK_ITERATION"
+    sorting: str = "SORTING_ITERATION"    # сортировка пробирок
+    scanning: str = "SCANNING_ITERATION"  # сканирование штативов
+    waiting: str = "WAITING"              # ожидание замены штативов
     none: str = "NONE"
 
 
 # Глобальные экземпляры для удобного использования
-NR = LoaderNRNumbers()
-NR_VAL = LoaderNRValues()
-SR = LoaderSRNumbers()
-SR_VAL = LoaderSRValues()
+NR = RobotNRNumbers()
+NR_VAL = RobotNRValues()
+SR = RobotSRNumbers()
+SR_VAL = RobotSRValues()

@@ -35,7 +35,7 @@ from src.eppendorf_sorter.domain.racks import (
     RackSystemManager,
 )
 
-from src.eppendorf_sorter.orchestration.robot_logic import MainLogicThread
+from src.eppendorf_sorter.orchestration.robot_logic import RobotThread
 from src.eppendorf_sorter.orchestration.shutdown import shutdown
 
 
@@ -259,7 +259,7 @@ def run_workcell():
     
     # Создаём главный поток обработки
     # logger.info("Создание главного потока обработки...")
-    main_thread = MainLogicThread(
+    main_thread = RobotThread(
         robot=robot,
         scanner=scanner,
         rack_manager=rack_manager,

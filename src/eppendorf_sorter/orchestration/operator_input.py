@@ -32,6 +32,7 @@ from src.eppendorf_sorter.domain.racks import (
 )
 from src.eppendorf_sorter.lis import LISClient
 from .robot_protocol import NR, NR_VAL, SR, SR_VAL
+from .operator_input import OperatorInputHandler
 
 
 ROBOT_CFG = load_robot_config()
@@ -75,6 +76,10 @@ class RobotThread(threading.Thread):
         self.lis_client = lis_client
         self.logger = logger
         self.stop_event = stop_event
+        
+        # Обработчик команд оператора
+        self.operator_input = OperatorInputHandler(logger, stop_event)
+        self.operator_input.set_status_callback(self._get_system_status)
 
     def _wait_until(self, condition, poll: float = 0.1, timeout: float = 30.0) -> bool:
         """
@@ -364,21 +369,28 @@ class RobotThread(threading.Thread):
             dest_rack = self.rack_manager.find_available_rack(tube.test_type)
             
             if not dest_rack:
-                # Нет доступных штативов - переходим в режим ожидания
+                # Нет доступных штативов - ждём замены от оператора
                 self.logger.error(f"Нет доступных штативов для типа {tube.test_type.name}")
                 self._enter_waiting_mode(f"Заполнены все штативы типа {tube.test_type.name}")
                 
-                # Ожидаем появления доступного штатива (замена оператором)
-                while not self.stop_event.is_set():
-                    dest_rack = self.rack_manager.find_available_rack(tube.test_type)
-                    if dest_rack:
-                        self.logger.info(f"✓ Доступен штатив #{dest_rack.rack_id} для типа {tube.test_type.name}")
-                        self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
-                        break
-                    time.sleep(2.0)
+                # Сбрасываем штативы этого типа (оператор заменил их)
+                self.rack_manager.reset_rack_pair(tube.test_type)
                 
-                if self.stop_event.is_set():
-                    break
+                # Ожидаем подтверждения от оператора
+                if not self.operator_input.wait_for_rack_replacement():
+                    # Timeout или stop_event
+                    if self.stop_event.is_set():
+                        break
+                    continue
+                
+                # Проверяем ещё раз после замены
+                dest_rack = self.rack_manager.find_available_rack(tube.test_type)
+                if not dest_rack:
+                    self.logger.error(f"После замены всё ещё нет штативов для {tube.test_type.name}")
+                    continue
+                
+                self.logger.info(f"✓ Доступен штатив #{dest_rack.rack_id} для типа {tube.test_type.name}")
+                self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
             
             # Выполняем сортировку пробирки
             success = self._execute_sorting_iteration(tube)
@@ -428,12 +440,35 @@ class RobotThread(threading.Thread):
                 return False, f"Нет доступных штативов для типа {test_type.name}"
         
         return True, ""
+    
+    def _get_system_status(self) -> str:
+        """Получить текстовый статус системы для отображения оператору."""
+        lines = []
+        
+        # Статус исходных паллетов
+        lines.append("ИСХОДНЫЕ ПАЛЛЕТЫ:")
+        for pallet in self.rack_manager.get_all_source_pallets():
+            scanned = pallet.get_tube_count()
+            sorted_count = pallet.get_sorted_count()
+            lines.append(f"  П{pallet.pallet_id}: {scanned} отсканировано, {sorted_count} отсортировано")
+        
+        # Статус целевых штативов
+        lines.append("\nЦЕЛЕВЫЕ ШТАТИВЫ:")
+        for rack in self.rack_manager.get_all_destination_racks():
+            count = rack.get_tube_count()
+            status = rack.get_status().value
+            lines.append(f"  #{rack.rack_id} ({rack.test_type.name}): {count}/50 [{status}]")
+        
+        return "\n".join(lines)
 
     def run(self) -> None:
         """
         Главный цикл работы робота.
         """
         self.logger.info("[Robot] Поток запущен")
+        
+        # Запускаем обработчик команд оператора
+        self.operator_input.start()
         
         try:
             # Подготовка робота к работе
@@ -453,8 +488,8 @@ class RobotThread(threading.Thread):
                 
                 if not can_start:
                     self._enter_waiting_mode(reason)
-                    time.sleep(5.0)
-                    continue
+                    if not self.operator_input.wait_for_rack_replacement():
+                        continue
                 
                 # 2. ФАЗА 1: Сканирование всех исходных штативов
                 all_tubes = self._scan_all_source_racks()
@@ -464,7 +499,10 @@ class RobotThread(threading.Thread):
                 
                 if not all_tubes:
                     self._enter_waiting_mode("Нет пробирок в исходных штативах")
-                    time.sleep(5.0)
+                    if not self.operator_input.wait_for_rack_replacement():
+                        continue
+                    # После замены сбрасываем паллеты
+                    self.rack_manager.reset_all_source_pallets()
                     continue
                 
                 # 3. ФАЗА 2: Физическая сортировка всех пробирок
@@ -482,14 +520,19 @@ class RobotThread(threading.Thread):
                 # Очищаем данные о отсортированных пробирках
                 self.rack_manager.clear_sorted_tubes()
                 
-                # Переходим в режим ожидания замены штативов
+                # Переходим в режим ожидания замены исходных штативов
                 self._enter_waiting_mode("Цикл завершён - требуется замена исходных штативов")
                 
-                # Ожидание действий оператора
-                time.sleep(10.0)
+                # Ожидаем подтверждения от оператора
+                if not self.operator_input.wait_for_rack_replacement():
+                    continue
+                
+                # Сбрасываем исходные паллеты для нового цикла
+                self.rack_manager.reset_all_source_pallets()
         
         except Exception as e:
             self.logger.fatal(f"Критическая ошибка в главном потоке: {e}", exc_info=True)
         
         finally:
+            self.operator_input.stop()
             self.logger.info("[Robot] Поток завершён")

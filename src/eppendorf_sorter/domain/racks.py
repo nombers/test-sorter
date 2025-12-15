@@ -188,14 +188,23 @@ class BaseRack:
     def get_tube_by_barcode(self, barcode: str) -> Optional[TubeInfo]:
         """Найти пробирку по баркоду"""
         with self._lock:
-            for tube in self.tubes:
-                if tube.barcode == barcode:
-                    return tube
-            return None
+            return self._get_tube_by_barcode_unsafe(barcode)
+    
+    def _get_tube_by_barcode_unsafe(self, barcode: str) -> Optional[TubeInfo]:
+        """Найти пробирку по баркоду (без блокировки, для внутреннего использования)"""
+        for tube in self.tubes:
+            if tube.barcode == barcode:
+                return tube
+        return None
+    
+    def _has_barcode_unsafe(self, barcode: str) -> bool:
+        """Проверить наличие пробирки (без блокировки)"""
+        return self._get_tube_by_barcode_unsafe(barcode) is not None
     
     def has_barcode(self, barcode: str) -> bool:
         """Проверить наличие пробирки"""
-        return self.get_tube_by_barcode(barcode) is not None
+        with self._lock:
+            return self._has_barcode_unsafe(barcode)
     
     # ---------------------- СТАТУСЫ ----------------------
     
@@ -235,6 +244,11 @@ class SourceRack(BaseRack):
         super().__init__(pallet_id)
         self._sorted_count = 0  # Сколько отсортировано
     
+    @property
+    def pallet_id(self) -> int:
+        """Алиас для rack_id для обратной совместимости"""
+        return self.rack_id
+    
     # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
     
     def add_scanned_tube(self, tube: TubeInfo):
@@ -243,8 +257,8 @@ class SourceRack(BaseRack):
             if tube.source_rack != self.rack_id:
                 raise ValueError(f"Пробирка принадлежит паллету {tube.source_rack}, а не {self.rack_id}")
             
-            # Проверяем дубликат
-            if self.has_barcode(tube.barcode):
+            # Проверяем дубликат (используем unsafe версию, т.к. уже под блокировкой)
+            if self._has_barcode_unsafe(tube.barcode):
                 logger.warning(f"Пробирка {tube.barcode} уже в паллете П{self.rack_id}")
                 return
             
@@ -259,7 +273,7 @@ class SourceRack(BaseRack):
     def mark_tube_sorted(self, barcode: str) -> bool:
         """Отметить пробирку как отсортированную"""
         with self._lock:
-            tube = self.get_tube_by_barcode(barcode)
+            tube = self._get_tube_by_barcode_unsafe(barcode)
             if not tube:
                 logger.warning(f"Пробирка {barcode} не найдена в П{self.rack_id}")
                 return False
@@ -357,6 +371,7 @@ class SourceRack(BaseRack):
         """Очистить отсортированные пробирки из памяти"""
         with self._lock:
             self.tubes = [t for t in self.tubes if t.destination_rack is None]
+            self._sorted_count = 0
             logger.debug(f"Очищены отсортированные пробирки из П{self.rack_id}")
     
 
@@ -430,6 +445,11 @@ class DestinationRack(BaseRack):
         """Количество свободных мест"""
         with self._lock:
             return self.MAX_TUBES - len(self.tubes)
+    
+    def get_next_position(self) -> int:
+        """Получить следующую позицию для размещения"""
+        with self._lock:
+            return self._next_number
     
     # ---------------------- УПРАВЛЕНИЕ ----------------------
     

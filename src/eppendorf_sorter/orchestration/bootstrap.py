@@ -27,14 +27,12 @@ from src.eppendorf_sorter.devices import (
 
 from src.eppendorf_sorter.domain.racks import (
     TestType,
-    RackStatus,
-    RackOccupancy,
-    TubeInfo,
     SourceRack,
     DestinationRack,
     RackSystemManager,
 )
 
+from src.eppendorf_sorter.lis import LISClient
 from src.eppendorf_sorter.orchestration.robot_logic import RobotThread
 from src.eppendorf_sorter.orchestration.shutdown import shutdown
 
@@ -52,10 +50,10 @@ def build_loggers() -> Dict[str, logging.Logger]:
     Returns:
         Словарь с логгерами
     """
-    logger = create_logger("ProjectR.Robot", "robot.log")
+    logger_robot = create_logger("ProjectR.Robot", "robot.log")
     
     return {
-        "loader": logger,
+        "robot": logger_robot,
     }
 
 
@@ -71,7 +69,6 @@ def initialize_source_racks() -> List[SourceRack]:
         SourceRack(pallet_id=1),  # П1
     ]
     
-    # logger.info(f"Инициализировано {len(source_racks)} исходных штативов")
     return source_racks
 
 
@@ -93,80 +90,84 @@ def initialize_destination_racks() -> List[DestinationRack]:
         DestinationRack(
             rack_id=0,
             test_type=TestType.OTHER,
-            target_count=50
+            target=50
         ),
         
         # Rack 1-2: UGI (pcr-1)
         DestinationRack(
             rack_id=1,
             test_type=TestType.UGI,
-            target_count=50
+            target=50
         ),
         DestinationRack(
             rack_id=2,
             test_type=TestType.UGI,
-            target_count=50
+            target=50
         ),
         
         # Rack 3-4: VPCH (pcr-2)
         DestinationRack(
             rack_id=3,
             test_type=TestType.VPCH,
-            target_count=50
+            target=50
         ),
         DestinationRack(
             rack_id=4,
             test_type=TestType.VPCH,
-            target_count=50
+            target=50
         ),
         
         # Rack 5-6: UGI_VPCH (оба теста)
         DestinationRack(
             rack_id=5,
             test_type=TestType.UGI_VPCH,
-            target_count=50
+            target=50
         ),
         DestinationRack(
             rack_id=6,
             test_type=TestType.UGI_VPCH,
-            target_count=50
+            target=50
         ),
     ]
     
-    # logger.info(f"Инициализировано {len(destination_racks)} целевых штативов")
     return destination_racks
 
 
-def initialize_rack_system_manager() -> RackSystemManager:
+def initialize_rack_system_manager(logger: logging.Logger) -> RackSystemManager:
     """
     Инициализирует RackSystemManager с исходными и целевыми штативами.
+    
+    Args:
+        logger: Логгер для вывода информации
     
     Returns:
         Настроенный RackSystemManager
     """
-    # Создаём исходные и целевые штативы
     source_racks = initialize_source_racks()
     destination_racks = initialize_destination_racks()
     
-    # Создаём менеджер
-    rack_manager = RackSystemManager(
-        source_pallets=source_racks,
-        destination_racks=destination_racks
+    rack_manager = RackSystemManager()
+    
+    # Инициализируем систему
+    rack_manager.initialize_system(
+        pallets_list=source_racks,
+        racks_list=destination_racks
     )
     
-    # logger.info("RackSystemManager инициализирован")
-    # logger.info(f"  - Исходных штативов: {len(source_racks)}")
-    # logger.info(f"  - Целевых штативов: {len(destination_racks)}")
+    logger.info("RackSystemManager инициализирован")
+    logger.info(f"  - Исходных паллетов: {len(source_racks)}")
+    logger.info(f"  - Целевых штативов: {len(destination_racks)}")
     
     return rack_manager
 
 
-def initialize_devices(config) -> tuple:
+def initialize_devices(config, logger: logging.Logger) -> tuple[CellRobot, Scanner]:
     """
     Инициализирует и подключает робота и сканер.
     
     Args:
         config: Конфигурация робота
+        logger: Логгер для вывода информации
     
     Returns:
         (robot, scanner) - подключённые устройства
@@ -174,34 +175,30 @@ def initialize_devices(config) -> tuple:
     Raises:
         Exception: При ошибке подключения к устройствам
     """
-    # logger.info("Подключение к устройствам...")
+    logger.info("Подключение к устройствам...")
     
-    # Создаём робота
     robot = RobotAgilebot(
-        host=config.ip,
-        name=config.name
+        name=config.name,
+        ip=config.ip
     )
     
-    # Создаём сканер
     scanner = ScannerHikrobotTCP(
-        host=config.scanner.ip,
-        port=config.scanner.port,
-        timeout=config.scanner.timeout
+        name=config.scanner.name,
+        ip=config.scanner.ip,
+        port=config.scanner.port
     )
     
-    # Подключаемся
     try:
         robot.connect()
-        # logger.info("✓ Робот подключен")
+        logger.info("✓ Робот подключен")
         
         scanner.connect()
-        # logger.info("✓ Сканер подключен")
+        logger.info("✓ Сканер подключен")
         
         return robot, scanner
         
     except Exception as e:
-        # logger.error(f"Ошибка подключения к устройствам: {e}")
-        # Пытаемся отключить уже подключённые устройства
+        logger.error(f"Ошибка подключения к устройствам: {e}")
         try:
             robot.disconnect()
         except:
@@ -213,7 +210,6 @@ def initialize_devices(config) -> tuple:
         raise
 
 
-
 def run_workcell():
     """
     Главная функция запуска системы сортировки.
@@ -221,35 +217,37 @@ def run_workcell():
     Инициализирует все компоненты, запускает главный поток обработки
     и обрабатывает корректное завершение работы.
     """
-    # Создаём событие остановки
+    # 0. Создаем объект для управления потоками
     stop_event = threading.Event()
     
-    # Настраиваем логирование
+    # 1. Логгеры + хуки
     loggers = build_loggers()
     install_global_exception_hooks()
-    # logger.info("Запуск системы сортировки пробирок...")
     
-    # Загружаем конфигурацию
+    loggers["robot"].info("="*60)
+    loggers["robot"].info("ЗАПУСК СИСТЕМЫ СОРТИРОВКИ ПРОБИРОК")
+    loggers["robot"].info("="*60)
+    
+    # 2. Загружаем конфигурацию
     config = ROBOT_CFG
-    # logger.info(f"Конфигурация загружена:")
-    # logger.info(f"  - Робот: {config.ip}")
-    # logger.info(f"  - Сканер: {config.scanner.ip}:{config.scanner.port}")
-    # logger.info(f"  - ЛИС: {config.lis.ip}:{config.lis.port}")
+    loggers["robot"].info("\nКонфигурация загружена:")
+    loggers["robot"].info(f"  - Робот: {config.name} ({config.ip})")
+    loggers["robot"].info(f"  - Сканер: {config.scanner.name} ({config.scanner.ip}:{config.scanner.port})")
+    loggers["robot"].info(f"  - ЛИС: {config.lis.ip}:{config.lis.port}")
     
-    # Инициализируем устройства
+    # 3. Инициализируем устройства
     try:
-        robot, scanner = initialize_devices(config)
+        robot, scanner = initialize_devices(config, loggers["robot"])
     except Exception as e:
-        # logger.error(f"Не удалось инициализировать устройства: {e}")
-        # logger.error("Система не может быть запущена")
+        loggers["robot"].error(f"\n❌ Не удалось инициализировать устройства: {e}")
+        loggers["robot"].error("Система не может быть запущена")
         return
     
-    # Инициализируем RackSystemManager
+    # 4. Инициализируем RackSystemManager
     try:
-        rack_manager = initialize_rack_system_manager()
+        rack_manager = initialize_rack_system_manager(loggers["robot"])
     except Exception as e:
-        # logger.error(f"Ошибка инициализации RackSystemManager: {e}")
-        # Отключаем устройства
+        loggers["robot"].error(f"\n❌ Ошибка инициализации RackSystemManager: {e}")
         try:
             robot.disconnect()
             scanner.disconnect()
@@ -257,74 +255,82 @@ def run_workcell():
             pass
         return
     
-    # Создаём главный поток обработки
-    # logger.info("Создание главного потока обработки...")
-    main_thread = RobotThread(
+    # 5. Инициализируем LIS клиент
+    lis_client = LISClient(
+        host=config.lis.ip,
+        port=config.lis.port,
+        max_workers=20
+    )
+    loggers["robot"].info("✓ LIS клиент инициализирован (workers=20)")
+    
+    # 6. Создаём главный поток обработки
+    loggers["robot"].info("\nСоздание главного потока обработки...")
+    robot_thread = RobotThread(
+        rack_manager=rack_manager,
         robot=robot,
         scanner=scanner,
-        rack_manager=rack_manager,
-        lis_host=config.lis.ip,
-        lis_port=config.lis.port,
-        logger=loggers["loader"],
+        lis_client=lis_client,
+        logger=loggers["robot"],
         stop_event=stop_event
     )
     
-    # Запускаем главный поток
-    # logger.info("Запуск главного потока обработки...")
-    main_thread.start()
-    # logger.info("✓ Система запущена и готова к работе")
+    # 7. Собираем все потоки, которыми управляем
+    threads: list[threading.Thread] = [
+        robot_thread,
+    ]
     
-    # Главный цикл - ожидание работы потока
+    # 8. Запускаем главный поток
+    loggers["robot"].info("Запуск главного потока обработки...")
+    robot_thread.start()
+    
+    loggers["robot"].info("\n" + "="*60)
+    loggers["robot"].info("✓ СИСТЕМА ЗАПУЩЕНА И ГОТОВА К РАБОТЕ")
+    loggers["robot"].info("="*60 + "\n")
+    
+    # 9. Основной цикл / ожидание
     try:
-        while main_thread.is_alive():
-            time.sleep(0.5)
+        loggers["robot"].info("Рабочая ячейка запущена. Нажмите Ctrl+C для остановки.")
+        # Ждём, пока нас не убьют Ctrl+C
+        while True:
+            time.sleep(1)
             
     except KeyboardInterrupt:
-        # logger.info("Получен сигнал остановки (Ctrl+C)")
+        loggers["robot"].info("\n" + "="*60)
+        loggers["robot"].info("⚠ Получен сигнал остановки (Ctrl+C)")
+        loggers["robot"].info("="*60)
         print("\n⚠ Остановка системы...")
     
-    # Останавливаем потоки
-    # logger.info("Остановка рабочих потоков...")
-    stop_event.set()
-    
-    # Ждём завершения главного потока
-    main_thread.join(timeout=10.0)
-    if main_thread.is_alive():
-        pass
-        # logger.warning("Главный поток не завершился за отведённое время")
-    else:
-        pass
-        # logger.info("✓ Главный поток остановлен")
-    
-    # Отключаем устройства
-    # logger.info("Отключение устройств...")
-    
-    try:
-        robot.disconnect()
-        # logger.info("✓ Робот отключен")
-    except Exception as e:
-        print(e)
-        # logger.error(f"Ошибка отключения робота: {e}")
-    
-    try:
-        scanner.disconnect()
-        # logger.info("✓ Сканер отключен")
-    except Exception as e:
-        print(e)
-        # logger.error(f"Ошибка отключения сканера: {e}")
-    
-    # Финальный статус системы
-    
-    try:
-        status = rack_manager.get_system_status()
-        # logger.info(status)
-    except Exception as e:
-        print(e)
-        # logger.error(f"Ошибка получения статуса: {e}")
-    
-    print("\n✓ Система остановлена.")
-
-
-if __name__ == "__main__":
-    """Точка входа при прямом запуске модуля"""
-    run_workcell()
+    finally:
+        # 10. Аккуратный shutdown
+        loggers["robot"].info("\nНачало процедуры остановки...")
+        shutdown(stop_event=stop_event, threads=threads, logger=loggers["robot"])
+        
+        # Останавливаем LIS клиент
+        loggers["robot"].info("Остановка LIS клиента...")
+        try:
+            lis_client.shutdown()
+            loggers["robot"].info("✓ LIS клиент остановлен")
+        except Exception as e:
+            loggers["robot"].error(f"❌ Ошибка остановки LIS клиента: {e}")
+        
+        # Гасим робота
+        loggers["robot"].info("Отключение робота...")
+        try:
+            robot.stop_all_running_programms()
+            robot.disconnect()
+            loggers["robot"].info("✓ Робот отключен")
+        except Exception as e:
+            loggers["robot"].error(f"❌ Ошибка при отключении робота: {e}")
+        
+        # Гасим сканер
+        loggers["robot"].info("Отключение сканера...")
+        try:
+            scanner.disconnect()
+            loggers["robot"].info("✓ Сканер отключен")
+        except Exception as e:
+            loggers["robot"].error(f"❌ Ошибка отключения сканера: {e}")
+        
+        loggers["robot"].info("\n" + "="*60)
+        loggers["robot"].info("✓ СИСТЕМА ПОЛНОСТЬЮ ОСТАНОВЛЕНА")
+        loggers["robot"].info("="*60)
+        print("\n✓ Система остановлена.")

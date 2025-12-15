@@ -276,7 +276,6 @@ class SourceRack(BaseRack):
             pallet_id: Уникальный ID паллета (0, 1, 2, ...)
         """
         super().__init__(pallet_id)
-        self.pallet_id = pallet_id  # Алиас для единообразия
         self._sorted_count = 0  # Сколько отсортировано
     
     # ---------------------- ОПЕРАЦИИ С ПРОБИРКАМИ ----------------------
@@ -284,16 +283,16 @@ class SourceRack(BaseRack):
     def add_scanned_tube(self, tube: TubeInfo):
         """Добавить отсканированную пробирку"""
         with self._lock:
-            if tube.source_rack != self.pallet_id:
-                raise ValueError(f"Пробирка принадлежит паллету {tube.source_rack}, а не {self.pallet_id}")
+            if tube.source_rack != self.rack_id:
+                raise ValueError(f"Пробирка принадлежит паллету {tube.source_rack}, а не {self.rack_id}")
             
             # Проверяем дубликат
             if self.has_barcode(tube.barcode):
-                logger.warning(f"Пробирка {tube.barcode} уже в паллете П{self.pallet_id}")
+                logger.warning(f"Пробирка {tube.barcode} уже в паллете П{self.rack_id}")
                 return
             
             self.tubes.append(tube)
-            logger.debug(f"Пробирка {tube.barcode} добавлена в П{self.pallet_id} ({len(self.tubes)}/{self.get_expected_count()})")
+            logger.debug(f"Пробирка {tube.barcode} добавлена в П{self.rack_id} ({len(self.tubes)}/50)")
     
     def add_scanned_tubes(self, tubes: List[TubeInfo]):
         """Добавить несколько пробирок"""
@@ -305,7 +304,7 @@ class SourceRack(BaseRack):
         with self._lock:
             tube = self.get_tube_by_barcode(barcode)
             if not tube:
-                logger.warning(f"Пробирка {barcode} не найдена в П{self.pallet_id}")
+                logger.warning(f"Пробирка {barcode} не найдена в П{self.rack_id}")
                 return False
             
             if tube.destination_rack is not None:
@@ -313,7 +312,7 @@ class SourceRack(BaseRack):
                 return False
             
             self._sorted_count += 1
-            logger.debug(f"Пробирка {barcode} отсортирована из П{self.pallet_id} ({self._sorted_count}/{len(self.tubes)})")
+            logger.debug(f"Пробирка {barcode} отсортирована из П{self.rack_id} ({self._sorted_count}/{len(self.tubes)})")
             return True
     
     # ---------------------- СТАТУСЫ И ПРОВЕРКИ ----------------------
@@ -321,14 +320,13 @@ class SourceRack(BaseRack):
     def get_status(self) -> RackStatus:
         """Получить статус заполненности"""
         with self._lock:
-            expected = self.get_expected_count()
             scanned = len(self.tubes)
             
             if scanned == 0:
                 return RackStatus.EMPTY
             elif self._sorted_count >= scanned:
                 return RackStatus.EMPTY  # Все отсортированы
-            elif scanned >= expected:
+            elif scanned >= self.MAX_TUBES:
                 return RackStatus.FULL
             else:
                 return RackStatus.PARTIAL
@@ -347,7 +345,7 @@ class SourceRack(BaseRack):
     def is_fully_scanned(self) -> bool:
         """Все ожидаемые пробирки отсканированы"""
         with self._lock:
-            return len(self.tubes) >= self.get_expected_count()
+            return len(self.tubes) >= self.MAX_TUBES
     
     def has_tubes_to_sort(self) -> bool:
         """Есть ли пробирки для сортировки"""
@@ -369,10 +367,9 @@ class SourceRack(BaseRack):
     def get_scan_progress(self) -> float:
         """Прогресс сканирования (0.0 - 1.0)"""
         with self._lock:
-            expected = self.get_expected_count()
-            if expected == 0:
+            if self.MAX_TUBES == 0:
                 return 1.0
-            return min(len(self.tubes) / expected, 1.0)
+            return min(len(self.tubes) / self.MAX_TUBES, 1.0)
     
     def get_sort_progress(self) -> float:
         """Прогресс сортировки (0.0 - 1.0)"""
@@ -397,13 +394,13 @@ class SourceRack(BaseRack):
             self.tubes = []
             self._sorted_count = 0
             self._occupancy = RackOccupancy.FREE
-            logger.info(f"Паллет П{self.pallet_id} сброшен")
+            logger.info(f"Паллет П{self.rack_id} сброшен")
     
     def clear_sorted(self):
         """Очистить отсортированные пробирки из памяти"""
         with self._lock:
             self.tubes = [t for t in self.tubes if t.destination_rack is None]
-            logger.debug(f"Очищены отсортированные пробирки из П{self.pallet_id}")
+            logger.debug(f"Очищены отсортированные пробирки из П{self.rack_id}")
     
 
 
@@ -415,17 +412,15 @@ class DestinationRack(BaseRack):
     Расширяет BaseRack функциональностью целевых значений и нумерации.
     """
     
-    def __init__(self, rack_id: int, test_type: TestType, pallet: int, target: int = 50):
+    def __init__(self, rack_id: int, test_type: TestType, target: int = 50):
         """
         Args:
             rack_id: Уникальный ID штатива
             test_type: Тип теста для этого штатива
-            pallet: ID паллета для робота
             target: Целевое количество пробирок
         """
         super().__init__(rack_id)
         self.test_type = test_type
-        self.pallet = pallet
         self.target = target
         self._next_number = 0  # Следующий номер для размещения пробирки
     
@@ -507,7 +502,7 @@ class RackSystemManager:
     
     def __init__(self):
         # Исходные паллеты
-        self.source_rack: Dict[int, SourceRack] = {}
+        self.source_pallets: Dict[int, SourceRack] = {}
         
         # Целевые штативы
         self.destination_racks: Dict[int, DestinationRack] = {}
@@ -519,13 +514,13 @@ class RackSystemManager:
     
     # ==================== ИНИЦИАЛИЗАЦИЯ ====================
     
-    def add_source_rack(self, pallet: SourceRack):
+    def add_source_pallet(self, pallet: SourceRack):
         """Добавить исходный паллет"""
         with self._lock:
-            if pallet.pallet_id in self.source_rack:
-                logger.warning(f"Паллет П{pallet.pallet_id} уже существует, перезапись")
-            self.source_rack[pallet.pallet_id] = pallet
-            logger.info(f"Добавлен исходный паллет П{pallet.pallet_id}")
+            if pallet.rack_id in self.source_pallets:
+                logger.warning(f"Паллет П{pallet.rack_id} уже существует, перезапись")
+            self.source_pallets[pallet.rack_id] = pallet
+            logger.info(f"Добавлен исходный паллет П{pallet.rack_id}")
     
     def add_destination_rack(self, rack: DestinationRack):
         """Добавить целевой штатив"""
@@ -646,7 +641,7 @@ class RackSystemManager:
             for pallet in self.source_pallets.values():
                 tube = pallet.get_tube_by_barcode(barcode)
                 if tube:
-                    return (pallet.pallet_id, tube)
+                    return (pallet.rack_id, tube)
             return None
     
     def find_tube_in_racks(self, barcode: str) -> Optional[Tuple[int, TubeInfo]]:
@@ -733,7 +728,7 @@ class RackSystemManager:
     def get_next_pallet_to_scan(self) -> Optional[SourceRack]:
         """Получить следующий паллет для сканирования"""
         with self._lock:
-            for pallet in sorted(self.source_pallets.values(), key=lambda p: p.pallet_id):
+            for pallet in sorted(self.source_pallets.values(), key=lambda p: p.rack_id):
                 if not pallet.is_fully_scanned() and pallet.is_available():
                     return pallet
             return None

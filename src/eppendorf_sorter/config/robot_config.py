@@ -35,7 +35,7 @@ def load_robot_config(path: Path | None = None) -> RobotcConfig:
     with cfg_path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    robot_raw = raw["loader"]
+    robot_raw = raw["robot"]
     scanner_raw = raw["scanner"]
     lis_raw = raw["lis"]
 

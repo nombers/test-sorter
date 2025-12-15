@@ -47,20 +47,15 @@ class TubeInfo:
     """
     
     def __init__(self, barcode: str, source_rack: int, number: int, 
-                 test_type: TestType, destination_rack: Optional[int] = None,
-                 destination_number: Optional[int] = None):
+                 test_type: TestType):
         self.barcode = barcode
         self.source_rack = source_rack
         self.number = number  # Номер пробирки в исходном штативе (0-49)
         self.test_type = test_type
         
-        # Назначение от ЛИС (куда ДОЛЖНА попасть пробирка)
-        self.destination_rack_lis: Optional[int] = destination_rack  # ID штатива от ЛИС
-        self.destination_number_lis: Optional[int] = destination_number  # Позиция от ЛИС (0-49)
-        
-        # Фактическое размещение (куда РЕАЛЬНО поместили)
-        self.destination_rack: Optional[int] = None  # Реальный ID штатива
-        self.destination_number: Optional[int] = None  # Реальная позиция (0-49)
+        # Фактическое размещение (куда поместили пробирку)
+        self.destination_rack: Optional[int] = None  # ID целевого штатива
+        self.destination_number: Optional[int] = None  # Позиция в целевом штативе (0-49)
     
     # ========== СВОЙСТВА ДЛЯ ИСТОЧНИКА ==========
     
@@ -73,22 +68,6 @@ class TubeInfo:
     def col(self) -> int:
         """Получить колонку из номера (0-4)"""
         return self.number % 5
-    
-    # ========== СВОЙСТВА ДЛЯ НАЗНАЧЕНИЯ ОТ ЛИС ==========
-    
-    @property
-    def destination_row_lis(self) -> Optional[int]:
-        """Получить ряд назначения от ЛИС"""
-        if self.destination_number_lis is None:
-            return None
-        return self.destination_number_lis // 5
-    
-    @property
-    def destination_col_lis(self) -> Optional[int]:
-        """Получить колонку назначения от ЛИС"""
-        if self.destination_number_lis is None:
-            return None
-        return self.destination_number_lis % 5
     
     # ========== СВОЙСТВА ДЛЯ ФАКТИЧЕСКОГО РАЗМЕЩЕНИЯ ==========
     
@@ -113,21 +92,6 @@ class TubeInfo:
         """Проверка, размещена ли пробирка физически"""
         return self.destination_rack is not None
     
-    @property
-    def is_rack_correct(self) -> bool:
-        """Проверка, размещена ли в правильный штатив (позиция может отличаться)"""
-        if not self.is_placed or self.destination_rack_lis is None:
-            return False
-        return self.destination_rack == self.destination_rack_lis
-    
-    @property
-    def is_placed_correctly(self) -> bool:
-        """Проверка, размещена ли в правильный штатив И позицию"""
-        if not self.is_placed or self.destination_rack_lis is None:
-            return False
-        return (self.destination_rack == self.destination_rack_lis and 
-                self.destination_number == self.destination_number_lis)
-    
     # ========== УТИЛИТЫ ==========
     
     @staticmethod
@@ -143,19 +107,12 @@ class TubeInfo:
     def __repr__(self):
         placement = ""
         if self.is_placed:
-            rack_check = "✓" if self.is_rack_correct else "✗"
-            pos_check = "✓" if self.is_placed_correctly else "✗"
-            placement = (f", dest_fact=R{self.destination_rack}[#{self.destination_number}]"
-                        f"(штатив{rack_check},поз{pos_check})")
-        
-        lis_info = ""
-        if self.destination_rack_lis is not None:
-            lis_info = f", dest_lis=R{self.destination_rack_lis}[#{self.destination_number_lis}]"
+            placement = f", dest=R{self.destination_rack}[#{self.destination_number}]"
         
         return (f"TubeInfo(barcode={self.barcode}, "
                 f"source=P{self.source_rack}[#{self.number}:r{self.row}c{self.col}], "
                 f"type={self.test_type.value}"
-                f"{lis_info}{placement})")
+                f"{placement})")
 
 
 
@@ -163,7 +120,7 @@ class TubeInfo:
 
 class BaseRack:
     """
-    Базовый класс для штативов и паллетов.
+    Базовый класс для штативов.
     Содержит общую логику управления пробирками и занятости.
     """
     
@@ -266,7 +223,7 @@ class BaseRack:
 
 class SourceRack(BaseRack):
     """
-    Исходный паллет с пробирками для сканирования и сортировки.
+    Исходный штатив с пробирками для сканирования и сортировки.
     Расширяет BaseRack функциональностью сканирования и отслеживания сортировки.
     """
     
@@ -501,7 +458,7 @@ class RackSystemManager:
     """
     
     def __init__(self):
-        # Исходные паллеты
+        # Исходные штативы
         self.source_pallets: Dict[int, SourceRack] = {}
         
         # Целевые штативы
@@ -515,12 +472,12 @@ class RackSystemManager:
     # ==================== ИНИЦИАЛИЗАЦИЯ ====================
     
     def add_source_pallet(self, pallet: SourceRack):
-        """Добавить исходный паллет"""
+        """Добавить исходный штатив"""
         with self._lock:
             if pallet.rack_id in self.source_pallets:
                 logger.warning(f"Паллет П{pallet.rack_id} уже существует, перезапись")
             self.source_pallets[pallet.rack_id] = pallet
-            logger.info(f"Добавлен исходный паллет П{pallet.rack_id}")
+            logger.info(f"Добавлен исходный штатив П{pallet.rack_id}")
     
     def add_destination_rack(self, rack: DestinationRack):
         """Добавить целевой штатив"""

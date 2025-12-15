@@ -259,9 +259,9 @@ def run_workcell():
     lis_client = LISClient(
         host=config.lis.ip,
         port=config.lis.port,
-        max_workers=20
+        max_workers=30
     )
-    loggers["robot"].info("✓ LIS клиент инициализирован (workers=20)")
+    loggers["robot"].info("✓ LIS клиент инициализирован (workers=30)")
     
     # 6. Создаём главный поток обработки
     loggers["robot"].info("\nСоздание главного потока обработки...")

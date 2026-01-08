@@ -1,538 +1,245 @@
-# src/eppendorf_sorter/orchestration/robot_logic.py
+# src/eppendorf_sorter/orchestration/operator_input.py
 """
-Главная логика сортировочного робота.
-Отвечает за сканирование штативов и сортировку пробирок.
-
-Процесс работы:
-1. ФАЗА СКАНИРОВАНИЯ: Сканирование всех пробирок из двух исходных штативов (П0, П1)
-   - Роботом сканируются все 100 позиций (2 штатива × 50 позиций)
-   - Баркоды отправляются параллельно в ЛИС для определения типов тестов
-   - Результаты сохраняются в RackSystemManager
-
-2. ФАЗА СОРТИРОВКИ: Физическая сортировка пробирок в целевые штативы
-   - Для каждой пробирки определяется целевой штатив на основе типа теста
-   - Робот перемещает пробирку из исходного штатива в целевой
-   - Целевые штативы заполняются последовательно
-
-3. РЕЖИМ ОЖИДАНИЯ: Пауза при необходимости действий оператора
-   - Когда исходные штативы пусты (нужна замена)
-   - Когда все целевые штативы определённого типа заполнены (нужна замена)
+Модуль для обработки команд оператора из терминала.
+Позволяет оператору подтверждать замену штативов и управлять системой.
 """
-import time
 import threading
 import logging
-from typing import List
-
-from src.eppendorf_sorter.devices import CellRobot, Scanner
-from src.eppendorf_sorter.config.robot_config import load_robot_config
-from src.eppendorf_sorter.domain.racks import (
-    RackSystemManager,
-    TestType,
-    TubeInfo,
-)
-from src.eppendorf_sorter.lis import LISClient
-from .robot_protocol import NR, NR_VAL, SR, SR_VAL
-from .operator_input import OperatorInputHandler
+from typing import Optional, Callable, Dict
 
 
-ROBOT_CFG = load_robot_config()
-SCANNER_CFG = ROBOT_CFG.scanner
-LIS_CFG = ROBOT_CFG.lis
-
-
-class RobotThread(threading.Thread):
+class OperatorInputHandler:
     """
-    Поток, выполняющий основную логику робота-сортировщика.
-    
-    Цикл работы робота состоит из двух фаз:
-    - Фаза 1: Полное сканирование исходных штативов с параллельными запросами к ЛИС
-    - Фаза 2: Физическая сортировка всех отсканированных пробирок
-    
-    После завершения цикла робот переходит в режим ожидания замены штативов.
+    Обработчик команд оператора из stdin.
+    Работает в отдельном потоке, не блокируя основную логику.
+
+    Поддерживаемые команды:
+        start   - подтверждение замены штативов / продолжить после паузы
+        pause   - поставить на паузу (после текущей атомарной операции)
+        stop    - остановка системы
+        status  - показать текущий статус
+        help    - показать справку
     """
 
-    def __init__(
-        self,
-        rack_manager: RackSystemManager,
-        robot: CellRobot,
-        scanner: Scanner,
-        lis_client: LISClient,
-        logger: logging.Logger,
-        stop_event: threading.Event,
-    ) -> None:
+    def __init__(self, logger: logging.Logger, stop_event: threading.Event):
         """
         Args:
-            rack_manager: Менеджер управления штативами
-            robot: Робот-манипулятор
-            scanner: QR-сканер для считывания баркодов
-            lis_client: Клиент для параллельных запросов к ЛИС
-            logger: Логгер для записи событий
-            stop_event: Событие для остановки потока
+            logger: Логгер для вывода сообщений
+            stop_event: Глобальное событие остановки системы
         """
-        super().__init__(name="RobotThread", daemon=True)
-        self.rack_manager = rack_manager
-        self.robot = robot
-        self.scanner = scanner
-        self.lis_client = lis_client
         self.logger = logger
         self.stop_event = stop_event
-        
-        # Обработчик команд оператора
-        self.operator_input = OperatorInputHandler(logger, stop_event)
-        self.operator_input.set_status_callback(self._get_system_status)
 
-    def _wait_until(self, condition, poll: float = 0.1, timeout: float = 30.0) -> bool:
+        # События для сигнализации о командах
+        self.rack_replaced_event = threading.Event()
+
+        # Флаг и событие для паузы
+        self._pause_requested = False  # Запрос на паузу (ставится командой pause)
+        self._paused = False           # Система на паузе
+        self._resume_event = threading.Event()  # Событие для выхода из паузы
+
+        # Callback для получения статуса (устанавливается извне)
+        self._status_callback: Optional[Callable[[], str]] = None
+
+        # Поток чтения stdin
+        self._input_thread: Optional[threading.Thread] = None
+        self._running = False
+    
+    def set_status_callback(self, callback: Callable[[], str]):
+        """Установить callback для получения статуса системы."""
+        self._status_callback = callback
+
+    def is_paused(self) -> bool:
+        """Проверить, находится ли система на паузе."""
+        return self._paused
+
+    def is_pause_requested(self) -> bool:
+        """Проверить, запрошена ли пауза."""
+        return self._pause_requested
+
+    def check_pause(self) -> bool:
         """
-        Ожидает выполнения условия с проверкой stop_event.
-        
-        Args:
-            condition: Функция, возвращающая bool
-            poll: Интервал проверки условия (сек)
-            timeout: Максимальное время ожидания (сек)
-            
+        Проверить и обработать запрос на паузу.
+
+        Вызывается после каждой атомарной операции.
+        Если запрошена пауза - блокирует выполнение до команды resume/start.
+
         Returns:
-            True если условие выполнилось, False если timeout или stop
+            True если можно продолжать, False если stop_event
         """
-        start_time = time.time()
+        if self.stop_event.is_set():
+            return False
+
+        if not self._pause_requested:
+            return True
+
+        # Входим в режим паузы
+        self._paused = True
+        self._pause_requested = False
+        self._resume_event.clear()
+
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("⏸  СИСТЕМА НА ПАУЗЕ")
+        self.logger.info("Прогресс сохранён. Введите 'start' для продолжения")
+        self.logger.info("=" * 60 + "\n")
+
+        # Ждём команды на продолжение или stop
         while not self.stop_event.is_set():
-            if condition():
+            if self._resume_event.wait(timeout=1.0):
+                self._paused = False
+                self.logger.info("▶  Продолжение работы...")
                 return True
-            if time.time() - start_time > timeout:
-                self.logger.warning(f"Таймаут ожидания условия ({timeout} сек)")
-                return False
-            time.sleep(poll)
+
+        self._paused = False
         return False
 
-    def _scan_all_source_racks(self) -> List[TubeInfo]:
-        """
-        ФАЗА 1: Сканирование всех пробирок из исходных штативов.
+    def start(self):
+        """Запустить обработчик команд."""
+        if self._running:
+            return
         
-        Использует протокол взаимодействия с роботом через регистры:
-        - Отправляет данные о позиции для сканирования через String Register
-        - Робот сам позиционируется к нужной позиции
-        - Получает команду на сканирование
-        - Сканер считывает QR код
-        - Отправляет результат роботу
-        
-        Returns:
-            Список TubeInfo со всей информацией о пробирках
-        """
-        self.logger.info("\n" + "="*60)
-        self.logger.info("ФАЗА 1: СКАНИРОВАНИЕ ИСХОДНЫХ ШТАТИВОВ")
-        self.logger.info("="*60 + "\n")
-        
-        all_scanned_tubes: List[TubeInfo] = []
-        
-        # Получаем все исходные штативы (П0, П1)
-        source_pallets = self.rack_manager.get_all_source_pallets()
-        
-        for pallet in source_pallets:
-            if self.stop_event.is_set():
-                return []
-            
-            # Используем pallet_id (алиас для rack_id)
-            self.logger.info(f"Сканирование паллета П{pallet.pallet_id}...")
-            
-            # Занимаем паллет для сканирования
-            pallet.occupy()
-            
-            try:
-                # Сканируем все 50 позиций (10 рядов × 5 колонок)
-                for position in range(50):
-                    if self.stop_event.is_set():
-                        break
-                    
-                    row = position // 5
-                    col = position % 5
-                    
-                    self.logger.debug(f"Сканирование П{pallet.pallet_id}[{row},{col}] (позиция {position})")
-                    
-                    # Формируем данные для сканирования: "PP RR CC"
-                    scan_data = f"{pallet.pallet_id:02d} {row:02d} {col:02d}"
-                    
-                    # Отправляем данные роботу
-                    self.robot.set_string_register(SR.scan_data, scan_data)
-                    self.logger.debug(f"Отправлены данные для сканирования: '{scan_data}'")
-                    
-                    # Устанавливаем тип итерации - сканирование
-                    self.robot.set_string_register(SR.iteration_type, SR_VAL.scanning)
-                    
-                    # Запускаем итерацию сканирования
-                    self.robot.set_number_register(NR.iteration_starter, NR_VAL.start)
-                    self.logger.debug("Команда на сканирование отправлена")
-                    
-                    # Ожидаем готовности робота к сканированию
-                    if not self._wait_until(
-                        lambda: self.robot.get_number_register(NR.scan_status) != NR_VAL.scan_reset,
-                        timeout=10.0
-                    ):
-                        self.logger.warning(f"Таймаут ожидания готовности П{pallet.pallet_id}[{row},{col}]")
-                        self.robot.set_number_register(NR.iteration_starter, NR_VAL.reset)
-                        continue
-                    
-                    self.logger.debug("Робот готов к сканированию")
-                    
-                    # Сканируем QR код пробирки
-                    barcode, scan_delay = self.scanner.scan(timeout=SCANNER_CFG.timeout)
-                    
-                    if barcode == "NoRead" or not barcode:
-                        # Пустая позиция
-                        self.logger.debug(f"П{pallet.pallet_id}[{row},{col}] - пусто")
-                        self.robot.set_number_register(NR.scan_status, NR_VAL.scan_bad)
-                    else:
-                        # Пробирка найдена
-                        self.logger.debug(f"П{pallet.pallet_id}[{row},{col}] -> {barcode}")
-                        
-                        tube = TubeInfo(
-                            barcode=barcode,
-                            source_rack=pallet.pallet_id,
-                            number=position,
-                            test_type=TestType.UNKNOWN
-                        )
-                        all_scanned_tubes.append(tube)
-                        
-                        # Сообщаем роботу об успешном сканировании
-                        self.robot.set_number_register(NR.scan_delay, scan_delay)
-                        self.robot.set_number_register(NR.scan_status, NR_VAL.scan_good)
-                    
-                    # Ожидаем завершения итерации сканирования
-                    if not self._wait_until(
-                        lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.end,
-                        timeout=10.0
-                    ):
-                        self.logger.warning(f"Таймаут завершения итерации П{pallet.pallet_id}[{row},{col}]")
-                    
-                    # Сбрасываем регистры для следующей итерации
-                    self.robot.set_number_register(NR.iteration_starter, NR_VAL.reset)
-                    self.robot.set_number_register(NR.scan_status, NR_VAL.scan_reset)
-                    self.robot.set_number_register(NR.scan_delay, NR_VAL.delay_reset)
-            
-            finally:
-                pallet.release()
-            
-            scanned_count = len([t for t in all_scanned_tubes if t.source_rack == pallet.pallet_id])
-            self.logger.info(f"✓ Паллет П{pallet.pallet_id}: отсканировано {scanned_count} пробирок")
-        
-        if not all_scanned_tubes:
-            self.logger.warning("Не найдено ни одной пробирки для сортировки")
-            return []
-        
-        self.logger.info(f"\n✓ Всего отсканировано: {len(all_scanned_tubes)} пробирок")
-        
-        # Параллельные запросы к ЛИС для определения типов тестов
-        self.logger.info(f"Отправка {len(all_scanned_tubes)} запросов к ЛИС...")
-        all_barcodes = [tube.barcode for tube in all_scanned_tubes]
-        barcode_to_test_type = self.lis_client.get_tube_types_batch(all_barcodes)
-        
-        # Обновляем информацию о типах тестов
-        for tube in all_scanned_tubes:
-            test_type = barcode_to_test_type.get(tube.barcode, TestType.ERROR)
-            tube.test_type = test_type
-            self.logger.debug(f"{tube.barcode} -> {test_type.name}")
-        
-        # Добавляем отсканированные пробирки в RackSystemManager
-        for tube in all_scanned_tubes:
-            self.rack_manager.add_scanned_tube(tube.source_rack, tube)
-        
-        # Выводим статистику по типам тестов
-        stats = {}
-        for tube in all_scanned_tubes:
-            stats[tube.test_type] = stats.get(tube.test_type, 0) + 1
-        
-        self.logger.info("\n📊 Статистика по типам тестов:")
-        for test_type, count in sorted(stats.items(), key=lambda x: x[1], reverse=True):
-            self.logger.info(f"  {test_type.name}: {count} шт")
-        
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info("✓ СКАНИРОВАНИЕ ЗАВЕРШЕНО")
-        self.logger.info(f"{'='*60}\n")
-        
-        return all_scanned_tubes
-
-    def _execute_sorting_iteration(self, tube: TubeInfo) -> bool:
-        """
-        Выполняет одну итерацию сортировки пробирки.
-        
-        Args:
-            tube: Информация о пробирке
-            
-        Returns:
-            True если пробирка успешно отсортирована, False при ошибке
-        """
-        self.logger.info(f"\n====SORTING ITERATION====")
-        self.logger.info(f"Пробирка: {tube.barcode} ({tube.test_type.name})")
-        
-        # Находим доступный целевой штатив для данного типа теста
-        dest_rack = self.rack_manager.find_available_rack(tube.test_type)
-        
-        if not dest_rack:
-            self.logger.error(f"Нет доступных штативов для типа {tube.test_type.name}")
-            return False
-        
-        # Определяем ID штатива и следующую свободную позицию
-        dest_rack_id = dest_rack.rack_id
-        dest_position = dest_rack.get_next_position()
-        
-        self.logger.info(f"Маршрут: П{tube.source_rack}[{tube.number}] -> Штатив #{dest_rack_id}[{dest_position}]")
-        
-        # Формируем строку данных для робота: "SS TT DD RR"
-        data_str = (
-            f"{tube.source_rack:02d} "
-            f"{tube.number:02d} "
-            f"{dest_rack_id:02d} "
-            f"{dest_position:02d}"
+        self._running = True
+        self._input_thread = threading.Thread(
+            target=self._input_loop,
+            name="OperatorInputThread",
+            daemon=True
         )
-        
-        # Отправляем данные роботу через String Register
-        self.robot.set_string_register(SR.movement_data, data_str)
-        self.logger.info(f"Данные для робота: '{data_str}'")
-        
-        # Устанавливаем тип итерации и запускаем
-        self.robot.set_string_register(SR.iteration_type, SR_VAL.sorting)
-        self.robot.set_number_register(NR.iteration_starter, NR_VAL.start)
-        self.logger.info("Команда на выполнение итерации отправлена")
-        
-        # Ожидаем статус захвата пробирки роботом
-        self.logger.info("Ожидание статуса захвата...")
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.grip_status) != NR_VAL.grip_reset,
-            timeout=30.0
-        ):
-            self.logger.error("Таймаут ожидания статуса захвата")
-            return False
-        
-        grip_status = self.robot.get_number_register(NR.grip_status)
-        
-        # Проверяем результат захвата
-        if grip_status == NR_VAL.grip_bad:
-            self.logger.warning("Пробирка не захвачена роботом - пропускаем")
-            self.robot.set_number_register(NR.grip_status, NR_VAL.grip_reset)
-            return False
-        
-        self.logger.info("✓ Пробирка успешно захвачена")
-        self.robot.set_number_register(NR.grip_status, NR_VAL.grip_reset)
-        
-        # Обновляем информацию в RackSystemManager
-        # add_tube() сам устанавливает destination_rack и destination_number
-        dest_rack.add_tube(tube)
-        self.rack_manager.mark_tube_sorted(tube.source_rack, tube.barcode)
-        
-        self.logger.info(f"✓ Пробирка размещена: Штатив #{dest_rack_id}[{tube.destination_number}]")
-        
-        # Ожидаем завершения итерации от робота
-        self.logger.info("Ожидание завершения итерации...")
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.end,
-            timeout=30.0
-        ):
-            self.logger.error("Таймаут ожидания завершения итерации")
-            return False
-        
-        self.logger.info("✓ Итерация завершена")
-        
-        # Сбрасываем флаг итерации для следующей пробирки
-        self.robot.set_number_register(NR.iteration_starter, NR_VAL.reset)
-        
-        # Логируем текущее состояние целевого штатива
-        self.logger.info(f"Штатив #{dest_rack_id}: {dest_rack.get_tube_count()}/{dest_rack.MAX_TUBES} пробирок")
-        
-        return True
-
-    def _sort_all_tubes(self, tubes: List[TubeInfo]) -> None:
+        self._input_thread.start()
+        self.logger.info("Обработчик команд оператора запущен")
+        self._print_help()
+    
+    def stop(self):
+        """Остановить обработчик команд."""
+        self._running = False
+        if self._input_thread and self._input_thread.is_alive():
+            # Поток daemon, завершится сам
+            pass
+        self.logger.info("Обработчик команд оператора остановлен")
+    
+    def wait_for_rack_replacement(self, timeout: Optional[float] = None) -> bool:
         """
-        ФАЗА 2: Физическая сортировка всех отсканированных пробирок.
+        Ожидать подтверждения замены штативов от оператора.
         
         Args:
-            tubes: Список пробирок для сортировки
+            timeout: Максимальное время ожидания (None = бесконечно)
+            
+        Returns:
+            True если получено подтверждение, False если timeout или stop_event
         """
+        self.rack_replaced_event.clear()
+        
         self.logger.info("\n" + "="*60)
-        self.logger.info("ФАЗА 2: ФИЗИЧЕСКАЯ СОРТИРОВКА ПРОБИРОК")
+        self.logger.info("⏳ ОЖИДАНИЕ ЗАМЕНЫ ШТАТИВОВ")
+        self.logger.info("Введите 'start' после замены штативов")
         self.logger.info("="*60 + "\n")
         
-        total_tubes = len(tubes)
-        processed = 0
-        failed = 0
-        
-        for idx, tube in enumerate(tubes, 1):
-            if self.stop_event.is_set():
-                break
+        # Ждём либо подтверждения, либо stop_event
+        while not self.stop_event.is_set():
+            if self.rack_replaced_event.wait(timeout=1.0):
+                self.logger.info("✓ Получено подтверждение замены штативов")
+                return True
             
-            self.logger.info(f"\n[{idx}/{total_tubes}] Обработка пробирки {tube.barcode}")
-            
-            # Пропускаем пробирки с ошибочным или неизвестным типом
-            if tube.test_type in [TestType.ERROR, TestType.UNKNOWN]:
-                self.logger.warning(f"Пропуск пробирки {tube.barcode} (тип: {tube.test_type.name})")
-                failed += 1
-                continue
-            
-            # Проверяем доступность целевого штатива для данного типа теста
-            dest_rack = self.rack_manager.find_available_rack(tube.test_type)
-            
-            if not dest_rack:
-                # Нет доступных штативов - ждём замены от оператора
-                self.logger.error(f"Нет доступных штативов для типа {tube.test_type.name}")
-                self._enter_waiting_mode(f"Заполнены все штативы типа {tube.test_type.name}")
-                
-                # Сбрасываем штативы этого типа (оператор заменил их)
-                self.rack_manager.reset_rack_pair(tube.test_type)
-                
-                # Ожидаем подтверждения от оператора
-                if not self.operator_input.wait_for_rack_replacement():
-                    # Timeout или stop_event
-                    if self.stop_event.is_set():
-                        break
-                    continue
-                
-                # Проверяем ещё раз после замены
-                dest_rack = self.rack_manager.find_available_rack(tube.test_type)
-                if not dest_rack:
-                    self.logger.error(f"После замены всё ещё нет штативов для {tube.test_type.name}")
-                    continue
-                
-                self.logger.info(f"✓ Доступен штатив #{dest_rack.rack_id} для типа {tube.test_type.name}")
-                self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
-            
-            # Выполняем сортировку пробирки
-            success = self._execute_sorting_iteration(tube)
-            
-            if success:
-                processed += 1
-                progress_pct = (processed * 100) // total_tubes
-                self.logger.info(f"Прогресс: {processed}/{total_tubes} ({progress_pct}%)")
-            else:
-                failed += 1
-                self.logger.warning(f"✗ Не удалось обработать пробирку {tube.barcode}")
+            if timeout is not None:
+                timeout -= 1.0
+                if timeout <= 0:
+                    self.logger.warning("Таймаут ожидания замены штативов")
+                    return False
         
-        # Итоговая статистика фазы сортировки
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info("ФАЗА СОРТИРОВКИ ЗАВЕРШЕНА")
-        self.logger.info(f"Успешно обработано: {processed}/{total_tubes}")
-        self.logger.info(f"Ошибок: {failed}")
-        self.logger.info(f"{'='*60}\n")
-
-    def _enter_waiting_mode(self, reason: str):
-        """
-        Переводит робота в режим ожидания.
-        
-        Args:
-            reason: Причина перехода в режим ожидания
-        """
-        self.logger.warning(f"\n{'='*60}")
-        self.logger.warning(f"⏸ РЕЖИМ ОЖИДАНИЯ")
-        self.logger.warning(f"Причина: {reason}")
-        self.logger.warning(f"Требуется действие оператора")
-        self.logger.warning(f"{'='*60}\n")
-        
-        # Устанавливаем тип итерации WAITING
-        self.robot.set_string_register(SR.iteration_type, SR_VAL.waiting)
-
-    def _check_can_start_cycle(self) -> tuple[bool, str]:
-        """
-        Проверяет возможность начала нового цикла работы.
-        
-        Returns:
-            (can_start, reason) - кортеж (можно ли начать цикл, причина если нельзя)
-        """
-        required_types = [TestType.UGI, TestType.VPCH, TestType.UGI_VPCH, TestType.OTHER]
-        
-        for test_type in required_types:
-            if not self.rack_manager.has_available_rack(test_type):
-                return False, f"Нет доступных штативов для типа {test_type.name}"
-        
-        return True, ""
+        return False
     
-    def _get_system_status(self) -> str:
-        """Получить текстовый статус системы для отображения оператору."""
-        lines = []
-        
-        # Статус исходных паллетов
-        lines.append("ИСХОДНЫЕ ПАЛЛЕТЫ:")
-        for pallet in self.rack_manager.get_all_source_pallets():
-            scanned = pallet.get_tube_count()
-            sorted_count = pallet.get_sorted_count()
-            lines.append(f"  П{pallet.pallet_id}: {scanned} отсканировано, {sorted_count} отсортировано")
-        
-        # Статус целевых штативов
-        lines.append("\nЦЕЛЕВЫЕ ШТАТИВЫ:")
-        for rack in self.rack_manager.get_all_destination_racks():
-            count = rack.get_tube_count()
-            status = rack.get_status().value
-            lines.append(f"  #{rack.rack_id} ({rack.test_type.name}): {count}/50 [{status}]")
-        
-        return "\n".join(lines)
+    def _input_loop(self):
+        """Основной цикл чтения команд из stdin."""
+        while self._running and not self.stop_event.is_set():
+            try:
+                # input() блокирующий, но поток daemon - завершится с программой
+                user_input = input().strip().lower()
+                
+                if not user_input:
+                    continue
+                
+                self._process_command(user_input)
+                
+            except EOFError:
+                # stdin закрыт
+                self.logger.debug("stdin закрыт")
+                break
+            except Exception as e:
+                self.logger.error(f"Ошибка чтения stdin: {e}")
+    
+    def _process_command(self, command: str):
+        """Обработать команду от оператора."""
 
-    def run(self) -> None:
-        """
-        Главный цикл работы робота.
-        """
-        self.logger.info("[Robot] Поток запущен")
-        
-        # Запускаем обработчик команд оператора
-        self.operator_input.start()
-        
-        try:
-            # Подготовка робота к работе
-            self.logger.info("Подготовка робота...")
-            self.robot.stop_all_running_programms()
-            time.sleep(0.5)
-            self.robot.reset_errors()
-            time.sleep(0.5)
-            self.robot.start_program(ROBOT_CFG.robot_program_name)
-            time.sleep(1.0)
-            self.logger.info("✓ Робот готов к работе!")
-            
-            # Основной цикл работы
-            while not self.stop_event.is_set():
-                # 1. Проверяем возможность начала нового цикла
-                can_start, reason = self._check_can_start_cycle()
-                
-                if not can_start:
-                    self._enter_waiting_mode(reason)
-                    if not self.operator_input.wait_for_rack_replacement():
-                        continue
-                
-                # 2. ФАЗА 1: Сканирование всех исходных штативов
-                all_tubes = self._scan_all_source_racks()
-                
-                if self.stop_event.is_set():
-                    break
-                
-                if not all_tubes:
-                    self._enter_waiting_mode("Нет пробирок в исходных штативах")
-                    if not self.operator_input.wait_for_rack_replacement():
-                        continue
-                    # После замены сбрасываем паллеты
-                    self.rack_manager.reset_all_source_pallets()
-                    continue
-                
-                # 3. ФАЗА 2: Физическая сортировка всех пробирок
-                self._sort_all_tubes(all_tubes)
-                
-                if self.stop_event.is_set():
-                    break
-                
-                # 4. Завершение цикла
-                self.logger.info("\n" + "="*60)
-                self.logger.info("✓ ЦИКЛ РАБОТЫ ЗАВЕРШЁН")
-                self.logger.info("Исходные штативы обработаны")
-                self.logger.info("="*60 + "\n")
-                
-                # Очищаем данные о отсортированных пробирках
-                self.rack_manager.clear_sorted_tubes()
-                
-                # Переходим в режим ожидания замены исходных штативов
-                self._enter_waiting_mode("Цикл завершён - требуется замена исходных штативов")
-                
-                # Ожидаем подтверждения от оператора
-                if not self.operator_input.wait_for_rack_replacement():
-                    continue
-                
-                # Сбрасываем исходные паллеты для нового цикла
-                self.rack_manager.reset_all_source_pallets()
-        
-        except Exception as e:
-            self.logger.fatal(f"Критическая ошибка в главном потоке: {e}", exc_info=True)
-        
-        finally:
-            self.operator_input.stop()
-            self.logger.info("[Robot] Поток завершён")
+        if command in ("start", "s", "go", "готово", "старт", "resume", "r"):
+            self._handle_start()
+
+        elif command in ("pause", "p", "пауза"):
+            self._handle_pause()
+
+        elif command in ("stop", "quit", "exit", "стоп", "выход"):
+            self._handle_stop()
+
+        elif command in ("status", "stat", "статус"):
+            self._handle_status()
+
+        elif command in ("help", "h", "?", "помощь"):
+            self._print_help()
+
+        else:
+            print(f"❌ Неизвестная команда: '{command}'. Введите 'help' для справки.")
+
+    def _handle_start(self):
+        """Обработка команды start - продолжить работу / выйти из паузы."""
+        if self._paused:
+            print("▶  Выход из паузы...")
+            self._resume_event.set()
+        else:
+            print("✓ Принято: продолжение работы")
+            self.rack_replaced_event.set()
+
+    def _handle_pause(self):
+        """Обработка команды pause - запрос на паузу."""
+        if self._paused:
+            print("ℹ  Система уже на паузе")
+        elif self._pause_requested:
+            print("ℹ  Пауза уже запрошена, ожидание завершения текущей операции...")
+        else:
+            self._pause_requested = True
+            print("⏸  Пауза запрошена. Система остановится после текущей атомарной операции.")
+
+    def _handle_stop(self):
+        """Обработка команды stop - остановка системы."""
+        print("⚠ Остановка системы...")
+        self.stop_event.set()
+        # Также снимаем паузу, чтобы поток мог завершиться
+        self._resume_event.set()
+
+    def _handle_status(self):
+        """Обработка команды status - вывод статуса системы."""
+        # Показываем состояние паузы
+        if self._paused:
+            print("⏸  Статус: НА ПАУЗЕ")
+        elif self._pause_requested:
+            print("⏳ Статус: Пауза запрошена...")
+        else:
+            print("▶  Статус: Работает")
+
+        if self._status_callback:
+            status = self._status_callback()
+            print(f"\n📊 СТАТУС СИСТЕМЫ:\n{status}\n")
+        else:
+            print("Детальный статус недоступен")
+
+    def _print_help(self):
+        """Вывести справку по командам."""
+        help_text = """
+╔══════════════════════════════════════════════════════════════╗
+║                    КОМАНДЫ ОПЕРАТОРА                         ║
+╠══════════════════════════════════════════════════════════════╣
+║  start, s, go    - Продолжить работу / выйти из паузы        ║
+║  pause, p        - Поставить на паузу (после текущей операции)║
+║  stop, exit      - Остановить систему                        ║
+║  status, stat    - Показать текущий статус                   ║
+║  help, h, ?      - Показать эту справку                      ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+        print(help_text)

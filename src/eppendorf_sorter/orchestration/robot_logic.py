@@ -645,32 +645,32 @@ class RobotThread(threading.Thread):
                     self.rack_manager.reset_all_source_pallets()
                     continue
                 
-                # 3. ФАЗА 2: Физическая сортировка всех пробирок
-                self._sort_all_tubes(all_tubes)
+                # # 3. ФАЗА 2: Физическая сортировка всех пробирок
+                # self._sort_all_tubes(all_tubes)
                 
-                if self.stop_event.is_set():
-                    break
+                # if self.stop_event.is_set():
+                #     break
                 
-                # 4. Завершение цикла
-                self.logger.info("\n" + "="*60)
-                self.logger.info("✓ ЦИКЛ РАБОТЫ ЗАВЕРШЁН")
-                self.logger.info("Исходные штативы обработаны")
-                self.logger.info("="*60 + "\n")
+                # # 4. Завершение цикла
+                # self.logger.info("\n" + "="*60)
+                # self.logger.info("✓ ЦИКЛ РАБОТЫ ЗАВЕРШЁН")
+                # self.logger.info("Исходные штативы обработаны")
+                # self.logger.info("="*60 + "\n")
                 
-                # Очищаем данные о отсортированных пробирках
-                self.rack_manager.clear_sorted_tubes()
+                # # Очищаем данные о отсортированных пробирках
+                # self.rack_manager.clear_sorted_tubes()
                 
-                # Переходим в режим ожидания замены исходных штативов
-                self._enter_waiting_mode("Цикл завершён - требуется замена исходных штативов")
+                # # Переходим в режим ожидания замены исходных штативов
+                # self._enter_waiting_mode("Цикл завершён - требуется замена исходных штативов")
 
-                # Ожидаем подтверждения от оператора
-                if not self.operator_input.wait_for_rack_replacement():
-                    continue
+                # # Ожидаем подтверждения от оператора
+                # if not self.operator_input.wait_for_rack_replacement():
+                #     continue
 
-                self._exit_waiting_mode()
+                # self._exit_waiting_mode()
 
-                # Сбрасываем исходные паллеты для нового цикла
-                self.rack_manager.reset_all_source_pallets()
+                # # Сбрасываем исходные паллеты для нового цикла
+                # self.rack_manager.reset_all_source_pallets()
         
         except Exception as e:
             self.logger.fatal(f"Критическая ошибка в главном потоке: {e}", exc_info=True)

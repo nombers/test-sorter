@@ -9,7 +9,7 @@ CONFIG_PATH = Path(__file__).with_name("robot.yaml")
 
 @dataclass(frozen=True)
 class LIS:
-    host: str
+    ip: str
     port: int
     
     

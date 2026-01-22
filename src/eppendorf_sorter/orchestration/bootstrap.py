@@ -65,8 +65,8 @@ def initialize_source_racks() -> List[SourceRack]:
         Список настроенных SourceRack
     """
     source_racks = [
-        SourceRack(pallet_id=0),  # П0
-        SourceRack(pallet_id=1),  # П1
+        SourceRack(pallet_id=1),  # П0
+        SourceRack(pallet_id=2),  # П1
     ]
     
     return source_racks
@@ -88,43 +88,43 @@ def initialize_destination_racks() -> List[DestinationRack]:
     destination_racks = [
         # Rack 0: Разное (OTHER)
         DestinationRack(
-            rack_id=0,
+            rack_id=3,
             test_type=TestType.OTHER,
             target=50
         ),
         
         # Rack 1-2: UGI (pcr-1)
         DestinationRack(
-            rack_id=1,
+            rack_id=4,
             test_type=TestType.UGI,
             target=50
         ),
         DestinationRack(
-            rack_id=2,
+            rack_id=5,
             test_type=TestType.UGI,
             target=50
         ),
         
         # Rack 3-4: VPCH (pcr-2)
         DestinationRack(
-            rack_id=3,
+            rack_id=6,
             test_type=TestType.VPCH,
             target=50
         ),
         DestinationRack(
-            rack_id=4,
+            rack_id=7,
             test_type=TestType.VPCH,
             target=50
         ),
         
         # Rack 5-6: UGI_VPCH (оба теста)
         DestinationRack(
-            rack_id=5,
+            rack_id=8,
             test_type=TestType.UGI_VPCH,
             target=50
         ),
         DestinationRack(
-            rack_id=6,
+            rack_id=9,
             test_type=TestType.UGI_VPCH,
             target=50
         ),

@@ -3,25 +3,33 @@
 Главная логика сортировочного робота.
 Отвечает за сканирование штативов и сортировку пробирок.
 
-Процесс работы:
-1. ФАЗА СКАНИРОВАНИЯ: Сканирование всех пробирок из двух исходных штативов (П0, П1)
-   - Роботом сканируются все 100 позиций (2 штатива × 50 позиций)
-   - Баркоды отправляются параллельно в ЛИС для определения типов тестов
-   - Результаты сохраняются в RackSystemManager
+ГРУППОВОЕ СКАНИРОВАНИЕ:
+=======================
+Сканер возвращает несколько баркодов за одну итерацию (разделённые ';'):
+- Группа 1: колонки 0, 1, 2 (3 пробирки) -> "barcode1;barcode2;barcode3"
+- Группа 2: колонки 3, 4 (2 пробирки) -> "barcode1;barcode2"
 
-2. ФАЗА СОРТИРОВКИ: Физическая сортировка пробирок в целевые штативы
-   - Для каждой пробирки определяется целевой штатив на основе типа теста
-   - Робот перемещает пробирку из исходного штатива в целевой
-   - Целевые штативы заполняются последовательно
+Каждый ряд (10 рядов в штативе) сканируется за 2 итерации робота.
 
-3. РЕЖИМ ОЖИДАНИЯ: Пауза при необходимости действий оператора
-   - Когда исходные штативы пусты (нужна замена)
-   - Когда все целевые штативы определённого типа заполнены (нужна замена)
+ПРОТОКОЛ ВЗАИМОДЕЙСТВИЯ С РОБОТОМ:
+==================================
+
+SCANNING_ITERATION:
+1. Python: ждёт R[1] = 0 (робот готов)
+2. Python: устанавливает SR[3] = "PP NN" (паллет, первая позиция группы)
+3. Python: устанавливает SR[1] = "SCANNING_ITERATION"
+4. Python: устанавливает R[1] = 1 (запуск итерации)
+5. Робот: едет в позицию, ставит R[2] = 1 (готов к сканированию)
+6. Python: видит R[2] = 1, выполняет сканирование
+7. Python: ставит R[2] = 0 (сканирование завершено)
+8. Робот: видит R[2] = 0, ставит R[1] = 2 (итерация завершена)
+9. Робот: сбрасывает R[1] = 0, R[2] = 0
+   (Python ждёт R[1] = 0 для следующей итерации)
 """
 import time
 import threading
 import logging
-from typing import List
+from typing import List, Optional, Tuple
 
 from src.eppendorf_sorter.devices import CellRobot, Scanner
 from src.eppendorf_sorter.config.robot_config import load_robot_config
@@ -43,12 +51,6 @@ LIS_CFG = ROBOT_CFG.lis
 class RobotThread(threading.Thread):
     """
     Поток, выполняющий основную логику робота-сортировщика.
-    
-    Цикл работы робота состоит из двух фаз:
-    - Фаза 1: Полное сканирование исходных штативов с параллельными запросами к ЛИС
-    - Фаза 2: Физическая сортировка всех отсканированных пробирок
-    
-    После завершения цикла робот переходит в режим ожидания замены штативов.
     """
 
     def __init__(
@@ -60,15 +62,6 @@ class RobotThread(threading.Thread):
         logger: logging.Logger,
         stop_event: threading.Event,
     ) -> None:
-        """
-        Args:
-            rack_manager: Менеджер управления штативами
-            robot: Робот-манипулятор
-            scanner: QR-сканер для считывания баркодов
-            lis_client: Клиент для параллельных запросов к ЛИС
-            logger: Логгер для записи событий
-            stop_event: Событие для остановки потока
-        """
         super().__init__(name="RobotThread", daemon=True)
         self.rack_manager = rack_manager
         self.robot = robot
@@ -77,67 +70,106 @@ class RobotThread(threading.Thread):
         self.logger = logger
         self.stop_event = stop_event
         
-        # Обработчик команд оператора
         self.operator_input = OperatorInputHandler(logger, stop_event)
         self.operator_input.set_status_callback(self._get_system_status)
 
-    def _wait_until(self, condition, poll: float = 0.1, timeout: float = 30.0) -> bool:
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+
+    def _wait_until(self, condition, poll: float = 0.05, timeout: float = 30.0) -> bool:
         """
         Ожидает выполнения условия с проверкой stop_event.
-
-        Args:
-            condition: Функция, возвращающая bool
-            poll: Интервал проверки условия (сек)
-            timeout: Максимальное время ожидания (сек)
-
-        Returns:
-            True если условие выполнилось, False если timeout или stop
         """
         start_time = time.time()
         while not self.stop_event.is_set():
-            if condition():
-                return True
-            if time.time() - start_time > timeout:
-                self.logger.warning(f"Таймаут ожидания условия ({timeout} сек)")
-                return False
-            time.sleep(poll)
+            try:
+                if condition():
+                    return True
+            except Exception as e:
+                self.logger.warning(f"Ошибка при проверке условия: {e}")
+                
         return False
 
-    def _wait_robot_ready(self, timeout: float = 5.0) -> bool:
+    def _wait_robot_ready(self, timeout: float = 15.0) -> bool:
         """
-        Ожидает готовности робота к принятию новой итерации.
-
-        Args:
-            timeout: Максимальное время ожидания (сек)
-
-        Returns:
-            True если робот готов, False если timeout или stop
+        Ожидает готовности робота (R[1] = 0).
         """
-        return self._wait_until(
+        self.logger.debug("Ожидание готовности робота (R[1] = 0)...")
+        result = self._wait_until(
             lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.ready,
             timeout=timeout
         )
+        if result:
+            self.logger.debug("Робот готов")
+        return result
+
+    def _wait_scan_ready(self, timeout: float = 20.0) -> bool:
+        """
+        Ожидает готовности робота к сканированию (R[2] = 1).
+        """
+        self.logger.debug("Ожидание позиционирования (R[2] = 1)...")
+        result = self._wait_until(
+            lambda: self.robot.get_number_register(NR.scan_status) == NR_VAL.scan_good,
+            timeout=timeout
+        )
+        if result:
+            self.logger.debug("Робот в позиции сканирования")
+        return result
+
+    def _wait_iteration_complete(self, timeout: float = 60.0) -> bool:
+        """
+        Ожидает завершения итерации (R[1] = 2).
+        """
+        self.logger.debug("Ожидание завершения итерации (R[1] = 2)...")
+        result = self._wait_until(
+            lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.completed,
+            timeout=timeout
+        )
+        if result:
+            self.logger.debug("Итерация завершена")
+        return result
+
+    def _parse_barcodes(self, raw_barcode: str) -> List[str]:
+        """
+        Парсит строку с баркодами (разделённые ';').
+        
+        Args:
+            raw_barcode: Строка вида "barcode1;barcode2;barcode3" или "NoRead"
+            
+        Returns:
+            Список баркодов (пустые строки для NoRead)
+        """
+        if not raw_barcode or raw_barcode == "NoRead":
+            return []
+        
+        # Разделяем по ';' и очищаем
+        barcodes = [b.strip() for b in raw_barcode.split(';')]
+        # Фильтруем пустые и NoRead
+        return [b for b in barcodes if b and b != "NoRead"]
+
+    # ==================== ФАЗА СКАНИРОВАНИЯ ====================
 
     def _scan_position_group(
         self, pallet_id: int, row: int, col_start: int, col_end: int
     ) -> List[TubeInfo]:
         """
         Сканирует группу позиций в одной строке штатива.
-
-        Одна итерация робота сканирует несколько позиций (атомарная операция).
-        Сканер возвращает кортеж баркодов для всех позиций группы.
-
-        Протокол:
-        1. Ждём R[1: Iteration_starter] = 0 (робот готов)
-        2. Устанавливаем SR[3: SCAN_DATA] = "PP NN"
-        3. Устанавливаем SR[1: ITERATION_TYPE] = "SCANNING_ITERATION"
-        4. Робот выполняет движение, сигнализирует через R[2: Scan_status]
-        5. Производим сканирование
-        6. Ждём R[1: Iteration_starter] = 2 (завершено)
-        7. Сбрасываем R[1: Iteration_starter] = 0
+        
+        Сканер возвращает несколько баркодов в одной строке, разделённых ';'.
+        Например: "2701200911;2708770050;2707602822"
+        
+        ПРОТОКОЛ:
+        1. Ждём R[1] = 0 (робот готов)
+        2. Устанавливаем SR[3] = "PP NN" (паллет, первая позиция)
+        3. Устанавливаем SR[1] = "SCANNING_ITERATION"
+        4. Устанавливаем R[1] = 1 (запуск)
+        5. Ждём R[2] = 1 (робот в позиции)
+        6. Выполняем сканирование (получаем группу баркодов)
+        7. Устанавливаем R[2] = 0 (сканирование завершено)
+        8. Ждём R[1] = 2 (итерация завершена)
+        9. Робот сам сбрасывает R[1] = 0
 
         Args:
-            pallet_id: ID паллета (0 или 1)
+            pallet_id: ID паллета (1 или 2)
             row: Номер ряда (0-9)
             col_start: Начальная колонка (включительно)
             col_end: Конечная колонка (не включительно)
@@ -147,6 +179,7 @@ class RobotThread(threading.Thread):
         """
         positions = [row * 5 + col for col in range(col_start, col_end)]
         group_size = len(positions)
+        first_position = positions[0]
 
         self.logger.debug(
             f"Сканирование П{pallet_id} ряд {row} колонки {col_start}-{col_end-1} "
@@ -154,81 +187,70 @@ class RobotThread(threading.Thread):
         )
 
         # 1. Ждём готовности робота
-        if not self._wait_robot_ready(timeout=10.0):
-            self.logger.warning(f"Робот не готов к сканированию П{pallet_id} ряд {row}")
+        if not self._wait_robot_ready(timeout=15.0):
+            self.logger.error(f"Робот не готов для сканирования П{pallet_id} ряд {row}")
             return []
 
         # 2. Формируем данные: "PP NN" - паллет и первая позиция группы
-        first_position = positions[0]
         scan_data = f"{pallet_id:02d} {first_position:02d}"
         self.robot.set_string_register(SR.scan_data, scan_data)
         self.logger.debug(f"SR[3: SCAN_DATA] = '{scan_data}'")
 
-        # 3. Устанавливаем тип итерации - сканирование
+        # 3. Устанавливаем тип итерации
         self.robot.set_string_register(SR.iteration_type, SR_VAL.scanning)
         self.logger.debug(f"SR[1: ITERATION_TYPE] = '{SR_VAL.scanning}'")
 
-        # 4. Ожидаем, что робот переместился и готов к сканированию (R[2: Scan_status] != 0)
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.scan_status) != NR_VAL.scan_reset,
-            timeout=15.0
-        ):
-            self.logger.warning(f"Таймаут ожидания готовности к сканированию П{pallet_id} ряд {row}")
-            # Сбрасываем состояние
-            self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
+        # 4. ЗАПУСКАЕМ ИТЕРАЦИЮ
+        self.robot.set_number_register(NR.iteration_starter, NR_VAL.started)
+        self.logger.debug("R[1] = 1 (итерация запущена)")
+
+        # 5. Ждём готовности к сканированию (R[2] = 1)
+        if not self._wait_scan_ready(timeout=20.0):
+            self.logger.warning(f"Таймаут позиционирования П{pallet_id} ряд {row}")
             return []
 
-        self.logger.debug("Робот в позиции сканирования")
+        # 6. Выполняем сканирование
+        raw_barcode, recv_time = self.scanner.scan(timeout=SCANNER_CFG.timeout)
+        self.logger.debug(f"Сканер вернул: '{raw_barcode}' за {recv_time:.3f}с")
 
-        # 5. Сканируем группу позиций - возвращает кортеж из 2 или 3 баркодов
-        barcodes = self.scanner.scan(timeout=SCANNER_CFG.timeout)
+        # 7. Сигнализируем роботу что сканирование завершено
+        self.robot.set_number_register(NR.scan_status, NR_VAL.scan_reset)
+        self.logger.debug("R[2] = 0 (сканирование завершено)")
 
-        # Проверяем что получили правильное количество баркодов
-        if len(barcodes) != group_size:
-            self.logger.warning(
-                f"Ожидалось {group_size} баркодов, получено {len(barcodes)}"
-            )
+        # # 8. Ждём завершения итерации
+        # if not self._wait_iteration_complete(timeout=15.0):
+        #     self.logger.warning(f"Таймаут завершения итерации П{pallet_id} ряд {row}")
+        #     # Продолжаем, чтобы не потерять данные
 
-        # Обрабатываем результаты сканирования
+        # Робот сам сбрасывает R[1] = 0
+
+        # Парсим баркоды (разделённые ';')
+        barcodes = self._parse_barcodes(raw_barcode)
+        
+        # Создаём TubeInfo для каждого баркода
         tubes: List[TubeInfo] = []
-        has_valid_barcode = False
-
+        
         for i, barcode in enumerate(barcodes):
             if i >= group_size:
+                self.logger.warning(f"Получено больше баркодов ({len(barcodes)}) чем позиций ({group_size})")
                 break
+            
             position = positions[i]
-
-            if barcode and barcode != "NoRead":
-                has_valid_barcode = True
-                self.logger.debug(f"П{pallet_id}[{position}] -> {barcode}")
-
-                tube = TubeInfo(
-                    barcode=barcode,
-                    source_rack=pallet_id,
-                    number=position,
-                    test_type=TestType.UNKNOWN
-                )
-                tubes.append(tube)
-            else:
+            self.logger.info(f"✓ П{pallet_id}[{position}] -> {barcode}")
+            
+            tube = TubeInfo(
+                barcode=barcode,
+                source_rack=pallet_id,
+                number=position,
+                test_type=TestType.UNKNOWN
+            )
+            tubes.append(tube)
+        
+        # Логируем пустые позиции
+        if len(barcodes) < group_size:
+            for i in range(len(barcodes), group_size):
+                position = positions[i]
                 self.logger.debug(f"П{pallet_id}[{position}] - пусто")
-
-        # Сообщаем роботу результат сканирования
-        if has_valid_barcode:
-            self.robot.set_number_register(NR.scan_status, NR_VAL.scan_good)
-        else:
-            self.robot.set_number_register(NR.scan_status, NR_VAL.scan_bad)
-
-        # 6. Ожидаем завершения итерации (R[1: Iteration_starter] = 2)
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.completed,
-            timeout=15.0
-        ):
-            self.logger.warning(f"Таймаут завершения итерации П{pallet_id} ряд {row}")
-
-        # 7. Сбрасываем регистры для следующей итерации
-        self.robot.set_number_register(NR.iteration_starter, NR_VAL.ready)
-        self.robot.set_number_register(NR.scan_status, NR_VAL.scan_reset)
-        self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
 
         return tubes
 
@@ -236,90 +258,95 @@ class RobotThread(threading.Thread):
         """
         ФАЗА 1: Сканирование всех пробирок из исходных штативов.
         
-        Использует протокол взаимодействия с роботом через регистры:
-        - Отправляет данные о позиции для сканирования через String Register
-        - Робот сам позиционируется к нужной позиции
-        - Получает команду на сканирование
-        - Сканер считывает QR код
-        - Отправляет результат роботу
+        Каждый ряд сканируется за 2 итерации:
+        - Группа 1: колонки 0, 1, 2 (3 пробирки)
+        - Группа 2: колонки 3, 4 (2 пробирки)
         
         Returns:
             Список TubeInfo со всей информацией о пробирках
         """
-        self.logger.info("\n" + "="*60)
+        self.logger.info("\n" + "=" * 60)
         self.logger.info("ФАЗА 1: СКАНИРОВАНИЕ ИСХОДНЫХ ШТАТИВОВ")
-        self.logger.info("="*60 + "\n")
+        self.logger.info("=" * 60 + "\n")
         
         all_scanned_tubes: List[TubeInfo] = []
         
-        # Получаем все исходные штативы (П0, П1)
+        # Получаем все исходные штативы
         source_pallets = self.rack_manager.get_all_source_pallets()
         
         for pallet in source_pallets:
             if self.stop_event.is_set():
-                return []
+                break
             
-            # Используем pallet_id (алиас для rack_id)
-            self.logger.info(f"Сканирование паллета П{pallet.pallet_id}...")
+            pallet_id = pallet.pallet_id
+            self.logger.info(f"\n--- Сканирование паллета П{pallet_id} ---")
             
-            # Занимаем паллет для сканирования
+            # Занимаем паллет
             pallet.occupy()
+            pallet_tubes: List[TubeInfo] = []
             
             try:
-                # Сканируем 10 рядов × 5 колонок
-                # Порядок: сначала колонки 0-2 (3 шт), потом колонки 3-4 (2 шт)
+                # Сканируем 10 рядов
                 for row in range(10):
                     if self.stop_event.is_set():
                         break
 
                     # Группа 1: колонки 0, 1, 2 (3 пробирки)
                     tubes_group1 = self._scan_position_group(
-                        pallet.pallet_id, row, col_start=0, col_end=3
+                        pallet_id, row, col_start=0, col_end=3
                     )
-                    all_scanned_tubes.extend(tubes_group1)
+                    pallet_tubes.extend(tubes_group1)
 
-                    # Проверка паузы после атомарной операции
+                    # Проверка паузы
                     if not self.operator_input.check_pause():
                         break
 
                     # Группа 2: колонки 3, 4 (2 пробирки)
                     tubes_group2 = self._scan_position_group(
-                        pallet.pallet_id, row, col_start=3, col_end=5
+                        pallet_id, row, col_start=3, col_end=5
                     )
-                    all_scanned_tubes.extend(tubes_group2)
+                    pallet_tubes.extend(tubes_group2)
 
-                    # Проверка паузы после атомарной операции
+                    # Проверка паузы
                     if not self.operator_input.check_pause():
                         break
+                    
+                    # Прогресс каждые 2 ряда
+                    if (row + 1) % 2 == 0:
+                        self.logger.info(
+                            f"П{pallet_id}: ряд {row + 1}/10, "
+                            f"найдено {len(pallet_tubes)} пробирок"
+                        )
             
             finally:
                 pallet.release()
             
-            scanned_count = len([t for t in all_scanned_tubes if t.source_rack == pallet.pallet_id])
-            self.logger.info(f"✓ Паллет П{pallet.pallet_id}: отсканировано {scanned_count} пробирок")
+            all_scanned_tubes.extend(pallet_tubes)
+            self.logger.info(
+                f"✓ Паллет П{pallet_id}: отсканировано {len(pallet_tubes)} пробирок"
+            )
         
         if not all_scanned_tubes:
-            self.logger.warning("Не найдено ни одной пробирки для сортировки")
+            self.logger.warning("Не найдено ни одной пробирки")
             return []
         
         self.logger.info(f"\n✓ Всего отсканировано: {len(all_scanned_tubes)} пробирок")
         
-        # Параллельные запросы к ЛИС для определения типов тестов
+        # Параллельные запросы к ЛИС
         self.logger.info(f"Отправка {len(all_scanned_tubes)} запросов к ЛИС...")
         all_barcodes = [tube.barcode for tube in all_scanned_tubes]
         barcode_to_test_type = self.lis_client.get_tube_types_batch(all_barcodes)
         
-        # Обновляем информацию о типах тестов
+        # Обновляем типы тестов
         for tube in all_scanned_tubes:
-            test_type = barcode_to_test_type.get(tube.barcode, TestType.ERROR)
-            tube.test_type = test_type
-            self.logger.debug(f"{tube.barcode} -> {test_type.name}")
+            tube.test_type = barcode_to_test_type.get(tube.barcode, TestType.ERROR)
+            self.logger.debug(f"{tube.barcode} -> {tube.test_type.name}")
         
-        # Добавляем отсканированные пробирки в RackSystemManager
+        # Добавляем в RackSystemManager
         for tube in all_scanned_tubes:
             self.rack_manager.add_scanned_tube(tube.source_rack, tube)
         
-        # Выводим статистику по типам тестов
+        # Статистика
         stats = {}
         for tube in all_scanned_tubes:
             stats[tube.test_type] = stats.get(tube.test_type, 0) + 1
@@ -328,108 +355,92 @@ class RobotThread(threading.Thread):
         for test_type, count in sorted(stats.items(), key=lambda x: x[1], reverse=True):
             self.logger.info(f"  {test_type.name}: {count} шт")
         
-        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"\n{'=' * 60}")
         self.logger.info("✓ СКАНИРОВАНИЕ ЗАВЕРШЕНО")
-        self.logger.info(f"{'='*60}\n")
+        self.logger.info(f"{'=' * 60}\n")
         
         return all_scanned_tubes
+
+    # ==================== ФАЗА СОРТИРОВКИ ====================
 
     def _execute_sorting_iteration(self, tube: TubeInfo) -> bool:
         """
         Выполняет одну итерацию сортировки пробирки.
 
-        Протокол:
-        1. Ждём R[1: Iteration_starter] = 0 (робот готов)
-        2. Устанавливаем SR[2: MOVEMENT_DATA] = "SS TT DD RR"
-        3. Устанавливаем SR[1: ITERATION_TYPE] = "SORTING_ITERATION"
-        4. Робот выполняет перемещение пробирки
-        5. Ждём R[1: Iteration_starter] = 2 (завершено)
-        6. Сбрасываем R[1: Iteration_starter] = 0
+        ПРОТОКОЛ:
+        1. Ждём R[1] = 0 (робот готов)
+        2. Устанавливаем SR[2] = "SS TT DD RR"
+        3. Устанавливаем SR[1] = "SORTING_ITERATION"
+        4. Устанавливаем R[1] = 1 (запуск)
+        5. Ждём R[1] = 2 (итерация завершена)
+        6. Робот сам сбрасывает R[1] = 0
 
         Args:
             tube: Информация о пробирке
 
         Returns:
-            True если пробирка успешно отсортирована, False при ошибке
+            True если успешно, False при ошибке
         """
-        self.logger.info(f"\n====SORTING ITERATION====")
-        self.logger.info(f"Пробирка: {tube.barcode} ({tube.test_type.name})")
-
-        # Находим доступный целевой штатив для данного типа теста
+        # Находим целевой штатив
         dest_rack = self.rack_manager.find_available_rack(tube.test_type)
-
+        
         if not dest_rack:
-            self.logger.error(f"Нет доступных штативов для типа {tube.test_type.name}")
+            self.logger.error(f"Нет штативов для типа {tube.test_type.name}")
             return False
 
-        # Определяем ID штатива и следующую свободную позицию
         dest_rack_id = dest_rack.rack_id
         dest_position = dest_rack.get_next_position()
 
-        self.logger.info(f"Маршрут: П{tube.source_rack}[{tube.number}] -> Штатив #{dest_rack_id}[{dest_position}]")
+        self.logger.info(
+            f"Сортировка: {tube.barcode} ({tube.test_type.name}) "
+            f"П{tube.source_rack}[{tube.number}] -> Штатив #{dest_rack_id}[{dest_position}]"
+        )
 
         # 1. Ждём готовности робота
-        if not self._wait_robot_ready(timeout=10.0):
-            self.logger.error("Робот не готов к сортировке")
+        if not self._wait_robot_ready(timeout=15.0):
+            self.logger.error("Робот не готов для сортировки")
             return False
 
-        # 2. Формируем строку данных для робота: "SS TT DD RR"
-        data_str = (
+        # 2. Формируем данные: "SS TT DD RR"
+        movement_data = (
             f"{tube.source_rack:02d} "
             f"{tube.number:02d} "
             f"{dest_rack_id:02d} "
             f"{dest_position:02d}"
         )
+        self.robot.set_string_register(SR.movement_data, movement_data)
+        self.logger.debug(f"SR[2: MOVEMENT_DATA] = '{movement_data}'")
 
-        # Отправляем данные роботу через String Register
-        self.robot.set_string_register(SR.movement_data, data_str)
-        self.logger.info(f"SR[2: MOVEMENT_DATA] = '{data_str}'")
-
-        # 3. Устанавливаем тип итерации - сортировка
+        # 3. Устанавливаем тип итерации
         self.robot.set_string_register(SR.iteration_type, SR_VAL.sorting)
-        self.logger.info(f"SR[1: ITERATION_TYPE] = '{SR_VAL.sorting}'")
+        self.logger.debug(f"SR[1: ITERATION_TYPE] = '{SR_VAL.sorting}'")
 
-        # 4. Ожидаем завершения итерации (R[1: Iteration_starter] = 2)
-        self.logger.info("Ожидание завершения перемещения...")
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.completed,
-            timeout=60.0  # Увеличен таймаут для физического перемещения
-        ):
-            self.logger.error("Таймаут ожидания завершения итерации")
-            # Сбрасываем состояние
-            self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
-            return False
+        # 4. ЗАПУСКАЕМ ИТЕРАЦИЮ
+        self.robot.set_number_register(NR.iteration_starter, NR_VAL.started)
+        self.logger.debug("R[1] = 1 (итерация запущена)")
 
-        self.logger.info("✓ Итерация завершена")
+        # Робот сам сбрасывает R[1] = 0
 
-        # Обновляем информацию в RackSystemManager
-        # add_tube() сам устанавливает destination_rack и destination_number
+        # Обновляем состояние
         dest_rack.add_tube(tube)
         self.rack_manager.mark_tube_sorted(tube.source_rack, tube.barcode)
 
-        self.logger.info(f"✓ Пробирка размещена: Штатив #{dest_rack_id}[{tube.destination_number}]")
-
-        # 5. Сбрасываем регистры для следующей итерации
-        self.robot.set_number_register(NR.iteration_starter, NR_VAL.ready)
-        self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
-
-        # Логируем текущее состояние целевого штатива
-        self.logger.info(f"Штатив #{dest_rack_id}: {dest_rack.get_tube_count()}/{dest_rack.MAX_TUBES} пробирок")
+        self.logger.info(
+            f"✓ Пробирка размещена: Штатив #{dest_rack_id}[{tube.destination_number}] "
+            f"({dest_rack.get_tube_count()}/{dest_rack.MAX_TUBES})"
+        )
 
         return True
 
     def _sort_all_tubes(self, tubes: List[TubeInfo]) -> None:
         """
-        ФАЗА 2: Физическая сортировка всех отсканированных пробирок.
-        
-        Args:
-            tubes: Список пробирок для сортировки
+        ФАЗА 2: Физическая сортировка всех пробирок.
         """
-        self.logger.info("\n" + "="*60)
+        self.logger.info("\n" + "=" * 60)
         self.logger.info("ФАЗА 2: ФИЗИЧЕСКАЯ СОРТИРОВКА ПРОБИРОК")
-        self.logger.info("="*60 + "\n")
+        self.logger.info("=" * 60 + "\n")
         
-        total_tubes = len(tubes)
+        total = len(tubes)
         processed = 0
         failed = 0
         
@@ -437,160 +448,125 @@ class RobotThread(threading.Thread):
             if self.stop_event.is_set():
                 break
             
-            self.logger.info(f"\n[{idx}/{total_tubes}] Обработка пробирки {tube.barcode}")
-            
-            # Пропускаем пробирки с ошибочным или неизвестным типом
+            # Пропускаем ошибочные
             if tube.test_type in [TestType.ERROR, TestType.UNKNOWN]:
-                self.logger.warning(f"Пропуск пробирки {tube.barcode} (тип: {tube.test_type.name})")
+                self.logger.warning(f"Пропуск {tube.barcode} (тип: {tube.test_type.name})")
                 failed += 1
                 continue
             
-            # Проверяем доступность целевого штатива для данного типа теста
+            # Проверяем доступность штатива
             dest_rack = self.rack_manager.find_available_rack(tube.test_type)
             
             if not dest_rack:
-                # Нет доступных штативов - ждём замены от оператора
-                self.logger.error(f"Нет доступных штативов для типа {tube.test_type.name}")
-                self._enter_waiting_mode(f"Заполнены все штативы типа {tube.test_type.name}")
-
-                # Ожидаем подтверждения от оператора
+                self.logger.warning(f"Нет штативов для {tube.test_type.name}")
+                self._enter_waiting_mode(f"Заполнены штативы типа {tube.test_type.name}")
+                
                 if not self.operator_input.wait_for_rack_replacement():
-                    # Timeout или stop_event
                     if self.stop_event.is_set():
                         break
                     continue
-
-                # Выходим из режима паузы
+                
                 self._exit_waiting_mode()
-
-                # Сбрасываем штативы этого типа (оператор заменил их)
                 self.rack_manager.reset_rack_pair(tube.test_type)
-
-                # Проверяем ещё раз после замены
+                
                 dest_rack = self.rack_manager.find_available_rack(tube.test_type)
                 if not dest_rack:
-                    self.logger.error(f"После замены всё ещё нет штативов для {tube.test_type.name}")
+                    self.logger.error(f"После замены нет штативов для {tube.test_type.name}")
+                    failed += 1
                     continue
-
-                self.logger.info(f"✓ Доступен штатив #{dest_rack.rack_id} для типа {tube.test_type.name}")
             
-            # Выполняем сортировку пробирки
-            success = self._execute_sorting_iteration(tube)
-
-            if success:
+            # Выполняем сортировку
+            if self._execute_sorting_iteration(tube):
                 processed += 1
-                progress_pct = (processed * 100) // total_tubes
-                self.logger.info(f"Прогресс: {processed}/{total_tubes} ({progress_pct}%)")
+                if processed % 10 == 0 or processed == total:
+                    self.logger.info(f"Прогресс: {processed}/{total} ({processed * 100 // total}%)")
             else:
                 failed += 1
-                self.logger.warning(f"✗ Не удалось обработать пробирку {tube.barcode}")
-
-            # Проверка паузы после атомарной операции (сортировка одной пробирки)
+                self.logger.warning(f"✗ Ошибка сортировки {tube.barcode}")
+            
+            # Проверка паузы
             if not self.operator_input.check_pause():
                 break
         
-        # Итоговая статистика фазы сортировки
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info("ФАЗА СОРТИРОВКИ ЗАВЕРШЕНА")
-        self.logger.info(f"Успешно обработано: {processed}/{total_tubes}")
-        self.logger.info(f"Ошибок: {failed}")
-        self.logger.info(f"{'='*60}\n")
+        self.logger.info(f"\n{'=' * 60}")
+        self.logger.info("СОРТИРОВКА ЗАВЕРШЕНА")
+        self.logger.info(f"Успешно: {processed}/{total}, Ошибок: {failed}")
+        self.logger.info(f"{'=' * 60}\n")
+
+    # ==================== РЕЖИМ ОЖИДАНИЯ ====================
 
     def _enter_waiting_mode(self, reason: str):
         """
-        Переводит робота в режим ожидания (пауза).
-
-        Протокол:
-        1. Ждём R[1: Iteration_starter] = 0 (робот готов)
-        2. Устанавливаем SR[1: ITERATION_TYPE] = "PAUSE"
-        3. Робот перемещается в home позицию
-        4. Ждём R[4: Pause_status] = 1 (пауза выполнена, оператор может действовать)
-        5. После действий оператора сбрасываем R[4: Pause_status] = 0
-        6. Устанавливаем SR[1: ITERATION_TYPE] = "NONE"
-
-        Args:
-            reason: Причина перехода в режим ожидания
+        Переводит робота в режим ожидания (home позиция).
         """
-        self.logger.warning(f"\n{'='*60}")
+        self.logger.warning(f"\n{'=' * 60}")
         self.logger.warning(f"⏸ РЕЖИМ ОЖИДАНИЯ")
         self.logger.warning(f"Причина: {reason}")
-        self.logger.warning(f"Требуется действие оператора")
-        self.logger.warning(f"{'='*60}\n")
+        self.logger.warning(f"{'=' * 60}\n")
 
-        # Ждём готовности робота
-        if not self._wait_robot_ready(timeout=10.0):
-            self.logger.warning("Робот не готов к переходу в режим паузы")
+        # 1. Ждём готовности
+        if not self._wait_robot_ready(timeout=15.0):
+            self.logger.warning("Робот не готов для паузы")
             return
 
-        # Устанавливаем тип итерации PAUSE
+        # 2. Устанавливаем тип итерации
         self.robot.set_string_register(SR.iteration_type, SR_VAL.pause)
-        self.logger.info(f"SR[1: ITERATION_TYPE] = '{SR_VAL.pause}'")
+        self.logger.debug(f"SR[1] = '{SR_VAL.pause}'")
 
-        # Ждём подтверждения что робот в home позиции (R[4: Pause_status] = 1)
+        # 3. Запускаем
+        self.robot.set_number_register(NR.iteration_starter, NR_VAL.started)
+        self.logger.debug("R[1] = 1")
+
+        # 4. Ждём подтверждения (R[4] = 1)
         if not self._wait_until(
             lambda: self.robot.get_number_register(NR.pause_status) == NR_VAL.pause_ready,
             timeout=30.0
         ):
-            self.logger.warning("Таймаут ожидания перехода в режим паузы")
+            self.logger.warning("Таймаут перехода в режим паузы")
             return
 
-        self.logger.info("✓ Робот в режиме ожидания (home позиция)")
+        self.logger.info("✓ Робот в режиме ожидания (home)")
 
     def _exit_waiting_mode(self):
         """
-        Выход из режима ожидания после действий оператора.
-
-        Протокол:
-        1. Сбрасываем R[4: Pause_status] = 0
-        2. Ждём R[1: Iteration_starter] = 2 (пауза завершена)
-        3. Сбрасываем R[1: Iteration_starter] = 0
-        4. Устанавливаем SR[1: ITERATION_TYPE] = "NONE"
+        Выход из режима ожидания.
         """
         self.logger.info("Выход из режима ожидания...")
 
-        # Сбрасываем статус паузы
+        # 1. Сигнализируем роботу
         self.robot.set_number_register(NR.pause_status, NR_VAL.pause_not_ready)
+        self.logger.debug("R[4] = 0")
 
-        # Ждём завершения паузы (R[1: Iteration_starter] = 2)
-        if not self._wait_until(
-            lambda: self.robot.get_number_register(NR.iteration_starter) == NR_VAL.completed,
-            timeout=10.0
-        ):
-            self.logger.warning("Таймаут ожидания завершения паузы")
+        # 2. Ждём завершения
+        if not self._wait_iteration_complete(timeout=10.0):
+            self.logger.warning("Таймаут выхода из паузы")
 
-        # Сбрасываем регистры
-        self.robot.set_number_register(NR.iteration_starter, NR_VAL.ready)
-        self.robot.set_string_register(SR.iteration_type, SR_VAL.none)
+        # Робот сам сбрасывает R[1] = 0
 
         self.logger.info("✓ Выход из режима ожидания завершён")
 
+    # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
+
     def _check_can_start_cycle(self) -> tuple[bool, str]:
-        """
-        Проверяет возможность начала нового цикла работы.
-        
-        Returns:
-            (can_start, reason) - кортеж (можно ли начать цикл, причина если нельзя)
-        """
+        """Проверяет возможность начала цикла."""
         required_types = [TestType.UGI, TestType.VPCH, TestType.UGI_VPCH, TestType.OTHER]
         
         for test_type in required_types:
             if not self.rack_manager.has_available_rack(test_type):
-                return False, f"Нет доступных штативов для типа {test_type.name}"
+                return False, f"Нет штативов для типа {test_type.name}"
         
         return True, ""
     
     def _get_system_status(self) -> str:
-        """Получить текстовый статус системы для отображения оператору."""
+        """Статус системы для оператора."""
         lines = []
         
-        # Статус исходных паллетов
         lines.append("ИСХОДНЫЕ ПАЛЛЕТЫ:")
         for pallet in self.rack_manager.get_all_source_pallets():
             scanned = pallet.get_tube_count()
             sorted_count = pallet.get_sorted_count()
-            lines.append(f"  П{pallet.pallet_id}: {scanned} отсканировано, {sorted_count} отсортировано")
+            lines.append(f"  П{pallet.pallet_id}: {scanned} скан., {sorted_count} сорт.")
         
-        # Статус целевых штативов
         lines.append("\nЦЕЛЕВЫЕ ШТАТИВЫ:")
         for rack in self.rack_manager.get_all_destination_racks():
             count = rack.get_tube_count()
@@ -599,17 +575,16 @@ class RobotThread(threading.Thread):
         
         return "\n".join(lines)
 
+    # ==================== ГЛАВНЫЙ ЦИКЛ ====================
+
     def run(self) -> None:
-        """
-        Главный цикл работы робота.
-        """
+        """Главный цикл работы робота."""
         self.logger.info("[Robot] Поток запущен")
         
-        # Запускаем обработчик команд оператора
         self.operator_input.start()
         
         try:
-            # Подготовка робота к работе
+            # Подготовка робота
             self.logger.info("Подготовка робота...")
             self.robot.stop_all_running_programms()
             time.sleep(0.5)
@@ -617,11 +592,11 @@ class RobotThread(threading.Thread):
             time.sleep(0.5)
             self.robot.start_program(ROBOT_CFG.robot_program_name)
             time.sleep(1.0)
-            self.logger.info("✓ Робот готов к работе!")
+            self.logger.info("✓ Робот готов!")
             
-            # Основной цикл работы
+            # Основной цикл
             while not self.stop_event.is_set():
-                # 1. Проверяем возможность начала нового цикла
+                # 1. Проверка готовности
                 can_start, reason = self._check_can_start_cycle()
                 
                 if not can_start:
@@ -630,50 +605,43 @@ class RobotThread(threading.Thread):
                         continue
                     self._exit_waiting_mode()
                 
-                # 2. ФАЗА 1: Сканирование всех исходных штативов
+                # 2. ФАЗА 1: Сканирование
                 all_tubes = self._scan_all_source_racks()
                 
                 if self.stop_event.is_set():
                     break
                 
                 if not all_tubes:
-                    self._enter_waiting_mode("Нет пробирок в исходных штативах")
+                    self._enter_waiting_mode("Нет пробирок в штативах")
                     if not self.operator_input.wait_for_rack_replacement():
                         continue
                     self._exit_waiting_mode()
-                    # После замены сбрасываем паллеты
                     self.rack_manager.reset_all_source_pallets()
                     continue
                 
-                # # 3. ФАЗА 2: Физическая сортировка всех пробирок
-                # self._sort_all_tubes(all_tubes)
+                # 3. ФАЗА 2: Сортировка
+                self._sort_all_tubes(all_tubes)
                 
-                # if self.stop_event.is_set():
-                #     break
+                if self.stop_event.is_set():
+                    break
                 
-                # # 4. Завершение цикла
-                # self.logger.info("\n" + "="*60)
-                # self.logger.info("✓ ЦИКЛ РАБОТЫ ЗАВЕРШЁН")
-                # self.logger.info("Исходные штативы обработаны")
-                # self.logger.info("="*60 + "\n")
+                # 4. Завершение цикла
+                self.logger.info("\n" + "=" * 60)
+                self.logger.info("✓ ЦИКЛ ЗАВЕРШЁН")
+                self.logger.info("=" * 60 + "\n")
                 
-                # # Очищаем данные о отсортированных пробирках
-                # self.rack_manager.clear_sorted_tubes()
+                self.rack_manager.clear_sorted_tubes()
                 
-                # # Переходим в режим ожидания замены исходных штативов
-                # self._enter_waiting_mode("Цикл завершён - требуется замена исходных штативов")
-
-                # # Ожидаем подтверждения от оператора
-                # if not self.operator_input.wait_for_rack_replacement():
-                #     continue
-
-                # self._exit_waiting_mode()
-
-                # # Сбрасываем исходные паллеты для нового цикла
-                # self.rack_manager.reset_all_source_pallets()
+                self._enter_waiting_mode("Требуется замена исходных штативов")
+                
+                if not self.operator_input.wait_for_rack_replacement():
+                    continue
+                
+                self._exit_waiting_mode()
+                self.rack_manager.reset_all_source_pallets()
         
         except Exception as e:
-            self.logger.fatal(f"Критическая ошибка в главном потоке: {e}", exc_info=True)
+            self.logger.fatal(f"Критическая ошибка: {e}", exc_info=True)
         
         finally:
             self.operator_input.stop()

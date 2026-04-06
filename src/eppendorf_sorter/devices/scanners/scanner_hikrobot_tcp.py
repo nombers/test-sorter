@@ -1,4 +1,11 @@
-# devices/scanners/scanner_hikrobot_tcp.py
+"""Реализация драйвера TCP-сканера Hikrobot.
+
+Предоставляет класс ScannerHikrobotTCP для управления промышленным
+сканером штрихкодов Hikrobot по протоколу TCP. Сканер использует
+текстовый протокол: команда 'start' активирует считывание,
+команда 'stop' прекращает его.
+"""
+
 import socket
 import time
 from functools import wraps
@@ -8,7 +15,20 @@ from src.eppendorf_sorter.devices import Scanner, ConnectionError, DeviceError
 
 
 def require_connection(func: Callable):
-    """Декоратор для проверки соединения со сканером."""
+    """Декоратор проверки активного соединения со сканером.
+
+    Проверяет флаг ``_connected`` и наличие сокета перед вызовом
+    декорированного метода.
+
+    Args:
+        func: Декорируемый метод экземпляра сканера.
+
+    Returns:
+        Обёрнутая функция с предварительной проверкой соединения.
+
+    Raises:
+        ConnectionError: Если сканер не подключен.
+    """
     @wraps(func)
     def wrapper(self, *args, **kwargs):
         if not self._connected or self._socket is None:
@@ -18,15 +38,29 @@ def require_connection(func: Callable):
 
 
 class ScannerHikrobotTCP(Scanner):
-    """
-    TCP-сканер Hikrobot.
-    Использует текстовые команды 'start' / 'stop' для управления сканированием.
+    """Драйвер промышленного сканера Hikrobot по протоколу TCP.
+
+    Управляет сканером через TCP-сокет с использованием текстового
+    протокола команд. Для начала сканирования отправляется команда
+    'start', для остановки -- 'stop'. Ответ сканера приходит
+    асинхронно через тот же сокет.
+
+    Attributes:
+        name: Человекочитаемое имя сканера для логирования.
     """
 
     def __init__(self, name: str, ip: str, port: int):
+        """Инициализация драйвера сканера Hikrobot.
+
+        Args:
+            name: Имя сканера, используемое в логах и сообщениях об ошибках.
+            ip: IP-адрес сканера в сети.
+            port: TCP-порт для подключения к сканеру.
+        """
         self.name = name
         self._ip = ip
         self._port = port
+        # Текстовые команды протокола Hikrobot для управления считыванием
         self._enable_message = "start"
         self._disable_message = "stop"
         self._socket: socket.socket | None = None
@@ -36,11 +70,20 @@ class ScannerHikrobotTCP(Scanner):
         self._connected = value
 
     def is_connected(self) -> bool:
-        """Возвращает текущий статус подключения."""
+        """Проверить текущий статус подключения.
+
+        Returns:
+            True, если соединение со сканером установлено.
+        """
         return self._connected
 
     def connect(self) -> None:
-        """Подключение к сканеру по TCP."""
+        """Установить TCP-соединение со сканером.
+
+        Raises:
+            ConnectionError: Если подключение не удалось (таймаут,
+                отказ соединения или ошибка сокета).
+        """
         print(f"[{self.name}] Подключение к сканеру {self._ip}:{self._port}")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -64,7 +107,11 @@ class ScannerHikrobotTCP(Scanner):
             print(f"[{self.name}] Подключение к сканеру успешно")
 
     def disconnect(self) -> None:
-        """Отключение от сканера."""
+        """Закрыть TCP-соединение со сканером.
+
+        Raises:
+            DeviceError: Если при закрытии сокета произошла ошибка ОС.
+        """
         print(f"[{self.name}] Отключение от сканера {self._ip}:{self._port}")
         if self._socket is not None:
             try:
@@ -77,16 +124,19 @@ class ScannerHikrobotTCP(Scanner):
         self._set_connected(False)
 
     def check_connection(self) -> bool:
-        """
-        Опциональная активная проверка соединения.
-        Можно вызывать периодически в фоне.
+        """Выполнить активную проверку соединения со сканером.
+
+        Отправляет пустой пакет для проверки доступности сокета.
+        Можно вызывать периодически в фоновом потоке.
+
+        Returns:
+            True, если соединение активно.
         """
         if self._socket is None:
             self._set_connected(False)
             return False
         try:
             self._socket.settimeout(0.5)
-            # Небольшой "ping": отправляем пустой байт
             self._socket.send(b"")
         except OSError:
             self._set_connected(False)
@@ -97,8 +147,12 @@ class ScannerHikrobotTCP(Scanner):
 
     @require_connection
     def stop_scan(self) -> None:
-        """Посылает команде сканеру прекратить сканирование."""
-        assert self._socket is not None 
+        """Отправить сканеру команду прекращения сканирования.
+
+        Raises:
+            DeviceError: Если отправка команды 'stop' не удалась.
+        """
+        assert self._socket is not None
         try:
             self._socket.sendall(self._disable_message.encode("utf-8"))
         except OSError as e:
@@ -106,14 +160,29 @@ class ScannerHikrobotTCP(Scanner):
 
     @require_connection
     def scan(self, timeout: float) -> tuple[str, float]:
-        """
-        Сканирование: возвращает (результат, время_операции_recv).
-        Если ничего не считано, возвращает ("NoRead", 0.0).
+        """Выполнить сканирование с ожиданием результата.
+
+        Отправляет команду 'start' для активации считывания, затем
+        ожидает ответ от сканера в цикле до истечения таймаута.
+        При успешном считывании отправляет 'stop' для прекращения
+        работы лазера/подсветки сканера.
+
+        Args:
+            timeout: Максимальное время ожидания считывания в секундах.
+
+        Returns:
+            Кортеж (результат, время_recv), где результат -- считанная
+            строка кода, а время_recv -- время выполнения recv() в секундах.
+            Если код не считан за timeout, возвращает ('NoRead', 0.0).
+
+        Raises:
+            DeviceError: Если произошла ошибка связи при старте
+                сканирования или при чтении данных из сокета.
         """
         assert self._socket is not None
         sock = self._socket
 
-        # Запустить процесс сканирования
+        # Отправляем 'start' -- сканер начинает считывание
         try:
             sock.settimeout(0.1)
             sock.sendall(self._enable_message.encode("utf-8"))
@@ -134,7 +203,7 @@ class ScannerHikrobotTCP(Scanner):
                 result = data.decode("utf-8").replace("\r", "").strip()
 
                 if result and result != "NoRead":
-                    # Останавливаем устройство
+                    # Отправляем 'stop' -- сканер прекращает считывание
                     try:
                         sock.sendall(self._disable_message.encode("utf-8"))
                     except OSError:
@@ -147,7 +216,7 @@ class ScannerHikrobotTCP(Scanner):
             except OSError as e:
                 raise DeviceError(f"[{self.name}] Ошибка при чтении: {e}") from e
 
-        # Если не считали код
+        # Таймаут истёк, код не считан -- останавливаем сканер
         try:
             sock.sendall(self._disable_message.encode("utf-8"))
         except OSError:

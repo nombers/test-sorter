@@ -1,186 +1,143 @@
 """
-Тестовый HTTP-сервер для эмуляции ответов ЛИС.
-Многопоточный сервер на стандартной библиотеке Python (без внешних зависимостей).
+Тестовый ЛИС сервер для локальной отладки.
 
-Возвращает рандомные типы тестов: pcr-1 (УГИ), pcr-2 (ВПЧ), pcr (Разное)
+Принимает GET-запросы с JSON body: {"tube_barcode": "123456789"}
+Отвечает JSON: {"tube_barcode": "123456789", "tests": ["PCR-1", "PCR-2", ...]}
 
-Эндпоинты:
-    GET /tube/<barcode> - получить информацию о пробирке (используется в client.py)
-    GET /health - проверка работоспособности сервера
+Типы тестов назначаются случайно с настраиваемыми весами.
+
+Запуск:
+    python test_server.py
+    python test_server.py --port 7117
+    python test_server.py --port 7117 --delay 0.5
 """
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+
 import json
 import random
-import logging
-from datetime import datetime
 import time
-import threading
-import re
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Варианты ответов и их веса (вероятности)
+TEST_VARIANTS = [
+    (["PCR-1"],          30),   # UGI
+    (["PCR-2"],          30),   # VPCH
+    (["PCR-1", "PCR-2"], 20),   # UGI_VPCH
+    (["PCR"],            20),   # OTHER
+]
 
-# Счётчик запросов (thread-safe)
-request_counter = {"count": 0}
-counter_lock = threading.Lock()
+TESTS_LIST = [v[0] for v in TEST_VARIANTS]
+WEIGHTS = [v[1] for v in TEST_VARIANTS]
 
-
-def get_request_count() -> int:
-    """Получить и инкрементировать счётчик запросов (thread-safe)"""
-    with counter_lock:
-        request_counter["count"] += 1
-        return request_counter["count"]
+# Настройки задержки (имитация реального сервера)
+RESPONSE_DELAY_MIN = 0.0
+RESPONSE_DELAY_MAX = 0.0
 
 
-class LISRequestHandler(BaseHTTPRequestHandler):
-    """Обработчик HTTP-запросов для тестового ЛИС сервера"""
-    
-    # Отключаем стандартный лог каждого запроса
-    def log_message(self, format, *args):
-        pass
-    
-    def _send_json_response(self, data: dict, status: int = 200):
-        """Отправить JSON-ответ"""
-        response = json.dumps(data, ensure_ascii=False)
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', len(response.encode('utf-8')))
-        self.end_headers()
-        self.wfile.write(response.encode('utf-8'))
-    
+class LISHandler(BaseHTTPRequestHandler):
+    """HTTP-обработчик, имитирующий поведение ЛИС сервера.
+
+    Принимает GET-запросы с JSON-телом, содержащим штрихкод пробирки,
+    и возвращает случайно выбранный набор тестов согласно настроенным весам.
+    """
+
     def do_GET(self):
-        """Обработка GET-запросов"""
-        
-        # GET /tube/<barcode>
-        tube_match = re.match(r'^/tube/(.+)$', self.path)
-        if tube_match:
-            barcode = tube_match.group(1)
-            self._handle_get_tube(barcode)
+        """Обрабатывает GET-запрос с JSON body вида {"tube_barcode": "..."}.
+
+        Извлекает штрихкод из тела запроса, опционально симулирует задержку
+        ответа и отвечает JSON с назначенным набором тестов.
+        """
+        content_length = int(self.headers.get("Content-Length", 0))
+
+        if content_length == 0:
+            self._send_error(400, "Отсутствует JSON body с tube_barcode")
             return
-        
-        # GET /health
-        if self.path == '/health':
-            self._handle_health()
+
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            self._send_error(400, "Невалидный JSON")
             return
-        
-        # GET /
-        if self.path == '/':
-            self._handle_index()
-            return
-        
-        # 404
-        self._send_json_response({
-            "status": "error",
-            "message": f"Endpoint not found: {self.path}"
-        }, 404)
-    
-    def _handle_get_tube(self, barcode: str):
-        """Получить информацию о пробирке по баркоду"""
-        req_num = get_request_count()
-        
-        logger.info(f"[#{req_num}] Запрос: barcode={barcode}")
-        
+
+        barcode = body.get("tube_barcode")
         if not barcode:
-            logger.warning(f"[#{req_num}] Пустой баркод")
-            self._send_json_response({
-                "status": "error",
-                "error_code": "MISSING_BARCODE",
-                "message": "Не указан штрихкод"
-            }, 400)
+            self._send_error(400, "Поле tube_barcode обязательно")
             return
-        
-        # Имитация задержки сети/БД (иногда)
-        delay = random.choice([0, 0, 0, 0, 0.1, 0.2])
-        if delay > 0:
+
+        # Имитация задержки
+        if RESPONSE_DELAY_MAX > 0:
+            delay = random.uniform(RESPONSE_DELAY_MIN, RESPONSE_DELAY_MAX)
             time.sleep(delay)
-        
-        # Случайный выбор типа теста
-        response_type = random.choice([
-            "pcr-1",           # только УГИ
-            "pcr-2",           # только ВПЧ
-            "pcr-1+pcr-2",     # УГИ + ВПЧ
-            "pcr"              # разное
-        ])
-        
-        # Формирование ответа в формате, ожидаемом client.py
-        if response_type == "pcr-1":
-            tests = ["pcr-1"]
-        elif response_type == "pcr-2":
-            tests = ["pcr-2"]
-        elif response_type == "pcr-1+pcr-2":
-            tests = ["pcr-1", "pcr-2"]
-        else:  # pcr
-            tests = ["pcr"]
-        
-        response_data = {
-            "barcode": barcode,
-            "tests": tests
+
+        # Генерируем ответ
+        tests = random.choices(TESTS_LIST, weights=WEIGHTS, k=1)[0]
+
+        response = {
+            "tube_barcode": barcode,
+            "tests": tests,
         }
-        
-        logger.info(f"[#{req_num}] Ответ: barcode={barcode}, tests={tests}")
-        
-        self._send_json_response(response_data, 200)
-    
-    def _handle_health(self):
-        """Проверка работоспособности сервера"""
-        with counter_lock:
-            count = request_counter["count"]
-        
-        self._send_json_response({
-            "status": "ok",
-            "server": "Test LIS Server (stdlib/Threaded)",
-            "requests_processed": count,
-            "timestamp": datetime.now().isoformat()
-        }, 200)
-    
-    def _handle_index(self):
-        """Главная страница с информацией о сервере"""
-        self._send_json_response({
-            "name": "Test LIS Server",
-            "version": "1.0",
-            "endpoints": {
-                "GET /tube/<barcode>": "Получить тип теста для пробирки",
-                "GET /health": "Проверка работоспособности"
-            }
-        }, 200)
+
+        self._send_json(200, response)
+
+        tests_str = ", ".join(tests) if tests else "(пусто)"
+        print(f"  [{barcode}] -> {tests_str}")
+
+    def _send_json(self, code: int, data: dict) -> None:
+        """Отправляет HTTP-ответ с JSON-телом.
+
+        Args:
+            code: HTTP-статус ответа.
+            data: Данные для сериализации в JSON.
+        """
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, code: int, message: str) -> None:
+        """Отправляет JSON-ответ с описанием ошибки.
+
+        Args:
+            code: HTTP-статус ошибки.
+            message: Текст сообщения об ошибке.
+        """
+        self._send_json(code, {"error": message})
+
+    def log_message(self, format, *args) -> None:
+        # Подавляем стандартный лог каждого запроса — он слишком шумный для отладки
+        pass
 
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Многопоточный HTTP-сервер"""
-    daemon_threads = True  # Потоки завершаются вместе с основным
+def main() -> None:
+    """Парсит аргументы командной строки и запускает тестовый HTTP-сервер."""
+    parser = argparse.ArgumentParser(description="Тестовый ЛИС сервер")
+    parser.add_argument("--host", default="0.0.0.0", help="Адрес (по умолчанию 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=7117, help="Порт (по умолчанию 7117)")
+    parser.add_argument("--delay", type=float, default=0.0,
+                        help="Макс. задержка ответа в секундах (по умолчанию 0)")
+    args = parser.parse_args()
 
+    global RESPONSE_DELAY_MAX
+    RESPONSE_DELAY_MAX = args.delay
 
-def run_server(host: str = '0.0.0.0', port: int = 7114):
-    """
-    Запуск сервера.
-    
-    Args:
-        host: Адрес для прослушивания
-        port: Порт сервера
-    """
-    print("=" * 70)
-    print("ТЕСТОВЫЙ СЕРВЕР ЛИС (stdlib/ThreadingMixIn)")
-    print("=" * 70)
-    print(f"\nАдрес: http://{host}:{port}")
-    print("\nЭндпоинты:")
-    print(f"  GET /tube/<barcode> - информация о пробирке")
-    print(f"  GET /health         - статус сервера")
-    print("=" * 70 + "\n")
-    
-    server = ThreadedHTTPServer((host, port), LISRequestHandler)
-    
+    server = ThreadingHTTPServer((args.host, args.port), LISHandler)
+
+    print(f"Тестовый ЛИС сервер запущен на http://{args.host}:{args.port}")
+    print(f"Задержка ответа: 0 - {args.delay}с")
+    print(f"Веса: PCR-1={WEIGHTS[0]}%, PCR-2={WEIGHTS[1]}%, "
+          f"PCR-1+PCR-2={WEIGHTS[2]}%, PCR={WEIGHTS[3]}%")
+    print("-" * 50)
+
     try:
-        logger.info(f"Сервер запущен на {host}:{port}")
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n\nОстановка сервера...")
-        server.shutdown()
-        logger.info("Сервер остановлен")
+        print("\nСервер остановлен")
+        server.server_close()
 
 
-if __name__ == '__main__':
-    run_server()
+if __name__ == "__main__":
+    main()
